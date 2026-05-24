@@ -50,3 +50,8 @@ echo "==> Binary:  $OUT/smr"
 echo "==> Arch:    ${OS}-${ARCH}"
 
 ls -lh "$OUT/${PKG}.tar.gz" "$OUT/smr"
+
+if [[ "${SMR_PACKAGE_WINDOWS:-0}" == "1" ]]; then
+  echo ""
+  bash "$ROOT/scripts/package-windows.sh"
+fi
