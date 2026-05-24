@@ -1,7 +1,9 @@
 use aho_corasick::AhoCorasick;
 use anyhow::Result;
+use regex::Regex;
 
-use crate::config::{ContentCategory, ContentRule, MatchMode};
+use crate::config::{ContentCategory, ContentRule, MatchMode, PipelineConfig};
+use crate::dlp::fragment::fragment_meets_threshold;
 use crate::dlp::sanitize::{sanitize_range, sanitize_whole};
 
 struct RuleMatcher {
@@ -12,10 +14,17 @@ pub struct ContentDlp {
     rules: Vec<RuleMatcher>,
     automaton: Option<AhoCorasick>,
     secret_rules: Vec<ContentRule>,
+    preset_patterns: Vec<(String, Regex)>,
 }
 
+const PRESET_SECRETS: &[(&str, &str)] = &[
+    ("preset-sk", r"sk-[A-Za-z0-9]{20,}"),
+    ("preset-akia", r"AKIA[0-9A-Z]{16}"),
+    ("preset-ghp", r"ghp_[A-Za-z0-9]{20,}"),
+];
+
 impl ContentDlp {
-    pub fn new(rules: &[ContentRule]) -> Result<Self> {
+    pub fn new(rules: &[ContentRule], pipeline: &PipelineConfig) -> Result<Self> {
         let active: Vec<ContentRule> = rules.iter().filter(|r| r.enabled).cloned().collect();
         let fragment_values: Vec<String> = active
             .iter()
@@ -33,10 +42,19 @@ impl ContentDlp {
             .cloned()
             .collect();
         let rules = active.into_iter().map(|rule| RuleMatcher { rule }).collect();
+
+        let mut preset_patterns = Vec::new();
+        if pipeline.builtin_credential_presets {
+            for (id, pat) in PRESET_SECRETS {
+                preset_patterns.push((id.to_string(), Regex::new(pat)?));
+            }
+        }
+
         Ok(Self {
             rules,
             automaton,
             secret_rules,
+            preset_patterns,
         })
     }
 
@@ -46,6 +64,13 @@ impl ContentDlp {
         for rule in &self.secret_rules {
             if result.contains(&rule.value) {
                 result = result.replace(&rule.value, &sanitize_whole(&rule.value));
+            }
+        }
+
+        for (id, re) in &self.preset_patterns {
+            for mat in re.find_iter(&result).map(|m| m.as_str().to_string()).collect::<Vec<_>>() {
+                result = result.replace(&mat, &sanitize_whole(&mat));
+                tracing::debug!(preset = %id, "sanitized builtin credential pattern");
             }
         }
 
@@ -62,17 +87,16 @@ impl ContentDlp {
         if let Some(ac) = &self.automaton {
             let mut ranges: Vec<(usize, usize)> = Vec::new();
             for mat in ac.find_iter(&result) {
-                let rule = self.find_fragment_rule(mat.pattern().as_usize());
-                if let Some(rule) = rule {
-                    let len = rule.value.chars().count();
-                    let min_len = rule
-                        .min_fragment_len
-                        .unwrap_or(8)
-                        .max(1);
-                    if len >= min_len {
-                        let start_byte = mat.start();
-                        let end_byte = mat.end();
-                        ranges.push((start_byte, end_byte));
+                if let Some(rule) = self.find_fragment_rule(mat.pattern().as_usize()) {
+                    let matched_len = mat.end() - mat.start();
+                    let source_len = rule.value.chars().count();
+                    if fragment_meets_threshold(
+                        source_len,
+                        matched_len,
+                        rule.min_fragment_len,
+                        rule.min_fragment_ratio,
+                    ) {
+                        ranges.push((mat.start(), mat.end()));
                     }
                 }
             }
@@ -130,7 +154,7 @@ fn apply_ranges(text: &str, ranges: &[(usize, usize)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ContentCategory, MatchMode};
+    use crate::config::{ContentCategory, MatchMode, PipelineConfig};
 
     #[test]
     fn secret_requires_full_match() {
@@ -143,10 +167,24 @@ mod tests {
             min_fragment_len: None,
             min_fragment_ratio: None,
         }];
-        let dlp = ContentDlp::new(&rules).unwrap();
+        let pipeline = PipelineConfig::default();
+        let dlp = ContentDlp::new(&rules, &pipeline).unwrap();
         let out = dlp.sanitize_text("prefix sk-secret-key suffix").unwrap();
         assert!(!out.contains("sk-secret-key"));
         let partial = dlp.sanitize_text("prefix sk-secret suffix").unwrap();
         assert_eq!(partial, "prefix sk-secret suffix");
+    }
+
+    #[test]
+    fn preset_sk_pattern() {
+        let pipeline = PipelineConfig {
+            builtin_credential_presets: true,
+            ..Default::default()
+        };
+        let dlp = ContentDlp::new(&[], &pipeline).unwrap();
+        let out = dlp
+            .sanitize_text("key is sk-abcdefghijklmnopqrstuvwxyz123456")
+            .unwrap();
+        assert!(!out.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
     }
 }

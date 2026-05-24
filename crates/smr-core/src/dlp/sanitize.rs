@@ -4,7 +4,8 @@ use rand::Rng;
 enum CharClass {
     Digit,
     Cjk,
-    LatinBasic,
+    LatinUpper,
+    LatinLower,
     LatinExt,
     EuroOther,
     Other,
@@ -42,10 +43,11 @@ fn replace_char(c: char, rng: &mut impl Rng) -> char {
             char::from(b'0' + d)
         }
         CharClass::Cjk => random_from(CJK_SAMPLE, rng),
-        CharClass::LatinBasic => random_from(LATIN_BASIC, rng),
+        CharClass::LatinUpper => random_from(LATIN_UPPER, rng),
+        CharClass::LatinLower => random_from(LATIN_LOWER, rng),
         CharClass::LatinExt => random_from(LATIN_EXT, rng),
         CharClass::EuroOther => random_from(EURO_OTHER, rng),
-        CharClass::Other => c,
+        CharClass::Other => random_from(OTHER_SAMPLE, rng),
     }
 }
 
@@ -57,8 +59,11 @@ fn classify(c: char) -> CharClass {
     if c.is_ascii_digit() {
         return CharClass::Digit;
     }
-    if c.is_ascii_alphabetic() {
-        return CharClass::LatinBasic;
+    if c.is_ascii_uppercase() {
+        return CharClass::LatinUpper;
+    }
+    if c.is_ascii_lowercase() {
+        return CharClass::LatinLower;
     }
     if c.is_whitespace() || c.is_ascii_punctuation() || c.is_ascii_control() {
         return CharClass::NonReadable;
@@ -84,12 +89,11 @@ fn classify(c: char) -> CharClass {
 }
 
 const CJK_SAMPLE: &[char] = &['李', '王', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴'];
-const LATIN_BASIC: &[char] = &[
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-    's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-];
+const LATIN_UPPER: &[char] = &['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'K', 'M', 'N', 'P', 'R', 'S', 'T'];
+const LATIN_LOWER: &[char] = &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'k', 'm', 'n', 'p', 'r', 's', 't'];
 const LATIN_EXT: &[char] = &['à', 'á', 'â', 'ã', 'ä', 'å', 'æ', 'ç', 'è', 'é', 'ê', 'ë'];
 const EURO_OTHER: &[char] = &['α', 'β', 'γ', 'δ', 'ε', 'ж', 'з', 'и', 'к', 'л'];
+const OTHER_SAMPLE: &[char] = &['ا', 'ب', 'ت', 'ث', 'ก', 'ข', 'ค', 'ง', 'ฮ', 'อ'];
 
 #[cfg(test)]
 mod tests {
@@ -103,10 +107,20 @@ mod tests {
     }
 
     #[test]
-    fn keeps_punctuation() {
-        let input = "hello, world!";
-        let out = sanitize_range(input, 0, input.len());
-        assert!(out.contains(','));
-        assert!(out.contains('!'));
+    fn preserves_case() {
+        let input = "Hello WORLD";
+        let out = sanitize_whole(input);
+        for (i, c) in out.chars().enumerate() {
+            let orig = input.chars().nth(i).unwrap();
+            assert_eq!(c.is_ascii_uppercase(), orig.is_ascii_uppercase());
+        }
+    }
+
+    #[test]
+    fn replaces_other_scripts() {
+        let input = "مرحبا";
+        let out = sanitize_whole(input);
+        assert_ne!(input, out);
+        assert_eq!(input.chars().count(), out.chars().count());
     }
 }

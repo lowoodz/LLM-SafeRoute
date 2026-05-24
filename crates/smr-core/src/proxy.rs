@@ -3,13 +3,16 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use smr_protocol::{
-    detect_protocol, extract_texts, inject_response_texts, inject_texts, parse_json_body,
-    serialize_json_body,
+    detect_protocol, extract_texts, filter_tool_related, inject_response_texts, inject_texts,
+    parse_json_body, serialize_json_body, ApiProtocol,
 };
 use tracing::info;
+use uuid::Uuid;
 
+use crate::audit::{protocol_label, RequestAudit};
 use crate::events::EventKind;
 use crate::request::{ForwardRequest, ProxyRequest, ProxyResponse};
+use crate::router::{convert_response_body, ForwardOptions, RouteResult};
 use crate::state::SharedApp;
 use crate::streaming::{is_sse_content_type, process_sse_response, request_wants_stream};
 
@@ -25,6 +28,10 @@ impl ProxyService {
     pub async fn handle_api_request(&self, req: ProxyRequest<'_>) -> Result<ProxyResponse> {
         let snap = self.app.snapshot();
         let events = self.app.events.clone();
+        let audit_id = Uuid::new_v4().to_string();
+        let mut dlp_count = 0u32;
+        let mut safety_blocks = 0u32;
+        let mut safety_observations = 0u32;
 
         let ProxyRequest {
             session_id,
@@ -42,52 +49,101 @@ impl ProxyService {
             .unwrap_or(false);
 
         let wants_stream = is_json && request_wants_stream(body);
+        let mut client_protocol = ApiProtocol::OpenAi;
+        let mut forward_body = body.to_vec();
 
-        let (forward_body, protocol) = if is_json && !body.is_empty() {
+        if is_json && !body.is_empty() {
             let mut json = parse_json_body(body)?;
-            let protocol = detect_protocol(path, headers, &json);
-
+            client_protocol = detect_protocol(path, headers, &json);
             let extracted = extract_texts(&json)?;
-            let all_text = extracted
-                .iter()
-                .map(|e| e.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
 
-            let dlp_replacements = snap.dlp.process_request(session_id, &all_text, &extracted)?;
-            if !dlp_replacements.is_empty() {
-                info!(count = dlp_replacements.len(), "DLP sanitized request fields");
-                inject_texts(&mut json, &dlp_replacements)?;
-                events.push(
-                    EventKind::DlpReplace,
-                    format!("sanitized {} field(s)", dlp_replacements.len()),
-                    None,
-                );
+            if snap.config.pipeline.ops_active() {
+                let tool_only = filter_tool_related(&json, &extracted);
+                let ops_replacements = snap.ops.process_fields(&tool_only)?;
+                if !ops_replacements.is_empty() {
+                    safety_blocks += ops_replacements.len() as u32;
+                    inject_texts(&mut json, &ops_replacements)?;
+                    events.push(
+                        EventKind::OpBlock,
+                        format!("blocked {} dangerous request tool_call(s)", ops_replacements.len()),
+                        None,
+                    );
+                }
             }
 
-            (serialize_json_body(&json)?, protocol)
-        } else {
-            let json = serde_json::json!({});
-            (body.to_vec(), detect_protocol(path, headers, &json))
-        };
+            if snap.config.pipeline.dlp_active() {
+                let (dlp_replacements, count) =
+                    snap.dlp.process_request(session_id, &extracted, &json)?;
+                dlp_count += count as u32;
+                if !dlp_replacements.is_empty() {
+                    info!(count = dlp_replacements.len(), "DLP sanitized request fields");
+                    inject_texts(&mut json, &dlp_replacements)?;
+                    events.push(
+                        EventKind::DlpReplace,
+                        format!("sanitized {} field(s)", dlp_replacements.len()),
+                        None,
+                    );
+                }
+            }
 
-        let group = snap.router.resolve_group(*fallback_group)?;
+            forward_body = serialize_json_body(&json)?;
+        } else if is_json {
+            let json = serde_json::json!({});
+            client_protocol = detect_protocol(path, headers, &json);
+        }
+
+        let (group_name, group) = snap.router.resolve_group(*fallback_group)?;
         let forward = ForwardRequest {
             method: req.method.clone(),
             path: req.path,
             query: req.query,
             headers: req.headers.clone(),
             body: Bytes::from(forward_body),
-            protocol,
+            protocol: client_protocol,
         };
 
-        let attempt = snap.router.forward_with_fallback(group, forward).await?;
-        let mut resp_body = attempt.body;
-        let resp_headers = attempt.headers.clone();
+        let RouteResult {
+            attempt,
+            fallback_chain,
+            group_name: resolved_group,
+        } = snap
+            .router
+            .forward_with_fallback(
+                &group_name,
+                &group,
+                forward,
+                ForwardOptions {
+                    wants_stream,
+                    client_protocol,
+                },
+            )
+            .await?;
 
-        if is_sse_content_type(&resp_headers) || wants_stream {
+        let endpoint_protocol = infer_endpoint_protocol(&attempt.endpoint);
+        let mut resp_body = attempt.body;
+        let mut resp_headers = attempt.headers.clone();
+
+        if client_protocol != endpoint_protocol
+            && !resp_body.is_empty()
+            && attempt.status.is_success()
+            && !is_sse_content_type(&resp_headers)
+        {
+            if let Ok(converted) =
+                convert_response_body(&resp_body, endpoint_protocol, client_protocol)
+            {
+                resp_body = converted;
+            }
+        }
+
+        if snap.config.pipeline.ops_active()
+            && (is_sse_content_type(&resp_headers) || wants_stream)
+        {
             let before = resp_body.clone();
-            resp_body = process_sse_response(&resp_body, &snap.ops)?;
+            let (new_body, blocks, observes) =
+                process_sse_response(&resp_body, &snap.ops, snap.config.pipeline.operation_security_mode)?;
+            resp_body = new_body;
+            safety_blocks += blocks;
+            safety_observations += observes;
             if resp_body != before {
                 events.push(
                     EventKind::OpBlock,
@@ -95,7 +151,7 @@ impl ProxyService {
                     None,
                 );
             }
-        } else {
+        } else if snap.config.pipeline.ops_active() {
             let resp_is_json = resp_headers
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
@@ -104,8 +160,15 @@ impl ProxyService {
 
             if resp_is_json && !resp_body.is_empty() && attempt.status.is_success() {
                 if let Ok(mut json) = parse_json_body(&resp_body) {
+                    if snap.config.pipeline.dlp_active() {
+                        let _ = snap.dlp.process_response_triggers(session_id, &json);
+                    }
                     let extracted = extract_texts(&json)?;
-                    let ops_replacements = snap.ops.process_response(&extracted)?;
+                    let tool_only = filter_tool_related(&json, &extracted);
+                    let (ops_replacements, blocks, observes) =
+                        snap.ops.process_fields_with_mode(&tool_only)?;
+                    safety_blocks += blocks;
+                    safety_observations += observes;
                     if !ops_replacements.is_empty() {
                         info!(
                             count = ops_replacements.len(),
@@ -118,19 +181,66 @@ impl ProxyService {
                             "blocked dangerous tool_call in response",
                             None,
                         );
+                    } else if snap.config.pipeline.dlp_active() {
+                        let _ = snap.dlp.process_response_triggers(session_id, &json);
                     }
                 }
             }
+        } else if snap.config.pipeline.dlp_active() && attempt.status.is_success() {
+            if let Ok(json) = parse_json_body(&resp_body) {
+                let _ = snap.dlp.process_response_triggers(session_id, &json);
+            }
         }
 
-        if attempt.status.is_success() {
+        let success = attempt.status.is_success();
+        if success {
             events.push(
                 EventKind::RouteSuccess,
                 format!("routed to {}", attempt.endpoint.model),
                 None,
             );
+        } else if fallback_chain.len() > 1 {
+            events.push(
+                EventKind::RouteFallback,
+                format!("fallback chain: {}", fallback_chain.join(" → ")),
+                None,
+            );
         }
 
+        let audit = RequestAudit {
+            id: audit_id,
+            timestamp: chrono::Utc::now(),
+            session_id: session_id.to_string(),
+            protocol: protocol_label(client_protocol).to_string(),
+            fallback_group: resolved_group,
+            fallback_chain,
+            final_model: if success {
+                Some(attempt.endpoint.model.clone())
+            } else {
+                None
+            },
+            dlp_replacements: dlp_count,
+            safety_blocks,
+            safety_observations,
+            success,
+            message: if success {
+                format!("routed to {}", attempt.endpoint.model)
+            } else {
+                String::from_utf8_lossy(&resp_body).into_owned()
+            },
+        };
+        let _ = self.app.storage.insert_audit(&audit);
+        events.push(EventKind::Info, audit.summary(), None);
+
         Ok((attempt.status, resp_headers, resp_body))
+    }
+}
+
+fn infer_endpoint_protocol(endpoint: &crate::config::ModelEndpoint) -> ApiProtocol {
+    let url = endpoint.base_url.to_ascii_lowercase();
+    if url.contains("anthropic.com") {
+        ApiProtocol::Anthropic
+    } else {
+        ApiProtocol::OpenAi
     }
 }

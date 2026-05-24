@@ -9,6 +9,7 @@ use crate::dlp::DlpEngine;
 use crate::events::{EventKind, EventLog};
 use crate::ops::OperationSecurity;
 use crate::router::Router;
+use crate::storage::AuditStore;
 
 pub struct AppEngines {
     pub config: AppConfig,
@@ -20,12 +21,17 @@ pub struct AppEngines {
 impl AppEngines {
     pub fn from_config(config: AppConfig) -> Result<Self> {
         let config_arc = Arc::new(config.clone());
+        let ops_enabled = config.pipeline.ops_active();
         Ok(Self {
             dlp: Arc::new(DlpEngine::new(&config)?),
-            ops: Arc::new(OperationSecurity::new(
-                &config.operation_rules,
-                config.pipeline.operation_security_mode,
-            )?),
+            ops: Arc::new(if ops_enabled {
+                OperationSecurity::new(
+                    &config.operation_rules,
+                    config.pipeline.operation_security_mode,
+                )?
+            } else {
+                OperationSecurity::new(&[], config.pipeline.operation_security_mode)?
+            }),
             router: Arc::new(Router::new(config_arc)),
             config,
         })
@@ -35,14 +41,21 @@ impl AppEngines {
 pub struct SharedApp {
     pub config_path: PathBuf,
     pub events: Arc<EventLog>,
+    pub storage: Arc<AuditStore>,
     inner: RwLock<AppEngines>,
 }
 
 impl SharedApp {
-    pub fn new(config_path: PathBuf, config: AppConfig, events: Arc<EventLog>) -> Result<Arc<Self>> {
+    pub fn new(
+        config_path: PathBuf,
+        config: AppConfig,
+        events: Arc<EventLog>,
+        storage: Arc<AuditStore>,
+    ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             config_path,
             events,
+            storage,
             inner: RwLock::new(AppEngines::from_config(config)?),
         }))
     }
@@ -63,6 +76,8 @@ impl SharedApp {
 
     pub fn reload(&self) -> Result<()> {
         let config = AppConfig::load(&self.config_path)?;
+        let dlp = self.inner.read().dlp.clone();
+        dlp.reload(&config)?;
         *self.inner.write() = AppEngines::from_config(config)?;
         self.events.push(
             EventKind::ConfigReload,
@@ -79,6 +94,8 @@ impl SharedApp {
         }
         let yaml = serde_yaml::to_string(config)?;
         std::fs::write(&self.config_path, yaml)?;
+        let dlp = self.inner.read().dlp.clone();
+        dlp.reload(config)?;
         *self.inner.write() = AppEngines::from_config(config.clone())?;
         self.events.push(EventKind::ConfigReload, "config saved", None);
         Ok(())
@@ -86,6 +103,7 @@ impl SharedApp {
 
     pub fn load_or_create(config_path: &Path, example_yaml: &str) -> Result<(Arc<Self>, PathBuf)> {
         let events = EventLog::new(500);
+        let storage = Arc::new(AuditStore::open(&AuditStore::default_path())?);
         let path = if config_path.as_os_str().is_empty() {
             crate::paths::init_default_config(example_yaml)?
         } else if config_path.exists() {
@@ -103,7 +121,7 @@ impl SharedApp {
         };
 
         let config = AppConfig::load(&path)?;
-        let app = SharedApp::new(path.clone(), config, events)?;
+        let app = SharedApp::new(path.clone(), config, events, storage)?;
         app.events.push(
             EventKind::Info,
             format!("started with config {}", path.display()),

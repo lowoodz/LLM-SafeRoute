@@ -38,16 +38,32 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineConfig {
+    #[serde(default = "default_true")]
+    pub security_enabled: bool,
     pub dlp_enabled: bool,
     pub operation_security_mode: OperationSecurityMode,
+    #[serde(default = "default_true")]
+    pub builtin_credential_presets: bool,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            security_enabled: true,
             dlp_enabled: true,
             operation_security_mode: OperationSecurityMode::Observe,
+            builtin_credential_presets: true,
         }
+    }
+}
+
+impl PipelineConfig {
+    pub fn dlp_active(&self) -> bool {
+        self.security_enabled && self.dlp_enabled
+    }
+
+    pub fn ops_active(&self) -> bool {
+        self.security_enabled
     }
 }
 

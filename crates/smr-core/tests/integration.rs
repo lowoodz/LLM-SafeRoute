@@ -7,6 +7,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use smr_core::config::*;
 use smr_core::events::EventLog;
+use smr_core::storage::AuditStore;
 use smr_core::proxy::ProxyService;
 use smr_core::request::ProxyRequest;
 use smr_core::state::SharedApp;
@@ -41,6 +42,7 @@ fn test_config(upstream_base: &str) -> AppConfig {
         pipeline: PipelineConfig {
             dlp_enabled: true,
             operation_security_mode: OperationSecurityMode::Enforce,
+            ..Default::default()
         },
         logging: LoggingConfig::default(),
         fallback_groups: groups,
@@ -69,7 +71,16 @@ fn test_config(upstream_base: &str) -> AppConfig {
 fn make_app(config: AppConfig) -> (Arc<SharedApp>, ProxyService) {
     let mut tmp = NamedTempFile::new().unwrap();
     write!(tmp, "{}", serde_yaml::to_string(&config).unwrap()).unwrap();
-    let app = SharedApp::new(tmp.path().to_path_buf(), config, EventLog::new(100)).unwrap();
+    let storage = Arc::new(
+        AuditStore::open(&std::env::temp_dir().join("smr-test-db")).unwrap(),
+    );
+    let app = SharedApp::new(
+        tmp.path().to_path_buf(),
+        config,
+        EventLog::new(100),
+        storage,
+    )
+    .unwrap();
     let proxy = ProxyService::new(app.clone());
     (app, proxy)
 }
@@ -206,7 +217,13 @@ async fn health_and_ui_endpoints() {
 
     let mut tmp = NamedTempFile::new().unwrap();
     write!(tmp, "{}", serde_yaml::to_string(&config).unwrap()).unwrap();
-    let app = SharedApp::new(tmp.path().to_path_buf(), config, EventLog::new(50)).unwrap();
+    let app = SharedApp::new(
+        tmp.path().to_path_buf(),
+        config,
+        EventLog::new(50),
+        Arc::new(AuditStore::open(&std::env::temp_dir().join("smr-test-db2")).unwrap()),
+    )
+    .unwrap();
 
     let handle = tokio::spawn(async move { run_app(app).await.ok(); });
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;

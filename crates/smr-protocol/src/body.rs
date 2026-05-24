@@ -54,6 +54,62 @@ pub fn extract_texts(body: &Value) -> Result<Vec<ExtractedText>> {
     Ok(out)
 }
 
+/// Extract only tool-call / tool-result fields (for path triggers and response-side session guard).
+pub fn extract_tool_call_texts(body: &Value) -> Result<Vec<ExtractedText>> {
+    let all = extract_texts(body)?;
+    Ok(filter_tool_related(body, &all))
+}
+
+/// Tool-related pointers: OpenAI tool args, Anthropic tool_use / tool_result blocks.
+pub fn is_tool_related(extracted: &ExtractedText, body: &Value) -> bool {
+    match &extracted.pointer {
+        TextPointer::OpenAiToolCallArguments { .. } => true,
+        TextPointer::AnthropicContentBlock {
+            message_index,
+            block_index,
+        } => {
+            if let Some(blocks) = body
+                .get("messages")
+                .and_then(|m| m.get(*message_index))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                return blocks.get(*block_index).is_some_and(|b| {
+                    matches!(
+                        b.get("type").and_then(|t| t.as_str()),
+                        Some("tool_use") | Some("tool_result")
+                    )
+                });
+            }
+            if let Some(blocks) = body.get("content").and_then(|c| c.as_array()) {
+                return blocks.get(*block_index).is_some_and(|b| {
+                    matches!(
+                        b.get("type").and_then(|t| t.as_str()),
+                        Some("tool_use") | Some("tool_result")
+                    )
+                });
+            }
+            if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
+                if let Some(msg) = choices.first().and_then(|c| c.get("message")) {
+                    if msg.get("tool_calls").is_some() {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+pub fn filter_tool_related(body: &Value, extracted: &[ExtractedText]) -> Vec<ExtractedText> {
+    extracted
+        .iter()
+        .filter(|e| is_tool_related(e, body))
+        .cloned()
+        .collect()
+}
+
 fn extract_openai_message(msg: &Value, mi: usize, out: &mut Vec<ExtractedText>) {
     match msg.get("content") {
         Some(Value::String(s)) => {

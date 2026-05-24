@@ -48,3 +48,5 @@ zip = "2"
 quick-xml = "0.37"
 grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "7"

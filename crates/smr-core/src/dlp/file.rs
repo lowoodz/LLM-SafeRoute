@@ -4,6 +4,8 @@ use anyhow::Result;
 use walkdir::WalkDir;
 
 use crate::config::{FileRule, MatchMode};
+use crate::dlp::file_index::FileIndexManager;
+use crate::dlp::fragment::fragment_meets_threshold;
 use crate::dlp::sanitize::{sanitize_range, sanitize_whole};
 use crate::dlp::session::ActiveFileContent;
 
@@ -13,39 +15,33 @@ pub struct FileContent {
     pub text: String,
 }
 
-struct IndexedFileRule {
-    rule: FileRule,
-    normalized_path: String,
-    contents: Vec<FileContent>,
-}
-
 pub struct FileDlp {
-    rules: Vec<IndexedFileRule>,
+    index: FileIndexManager,
 }
 
 impl FileDlp {
     pub fn new(rules: &[FileRule]) -> Result<Self> {
-        let mut indexed = Vec::new();
-        for rule in rules.iter().filter(|r| r.enabled) {
-            let contents = load_rule_contents(rule)?;
-            let normalized_path = normalize_path(&rule.path);
-            indexed.push(IndexedFileRule {
-                rule: rule.clone(),
-                normalized_path,
-                contents,
-            });
-        }
-        Ok(Self { rules: indexed })
+        Ok(Self {
+            index: FileIndexManager::new(rules),
+        })
     }
 
-    pub fn check_path_triggers(
+    pub fn reload(&self, rules: &[FileRule]) -> Result<()> {
+        self.index.rebuild_sync(rules)
+    }
+
+    pub fn is_index_ready(&self) -> bool {
+        self.index.is_ready()
+    }
+
+  pub fn check_path_triggers_in_tool_text(
         &self,
         session_id: &str,
-        text: &str,
+        tool_text: &str,
         activate: impl Fn(&str, &FileRule, &[FileContent]),
     ) {
-        for indexed in &self.rules {
-            if text.contains(&indexed.normalized_path) {
+        for indexed in self.index.rules() {
+            if tool_text.contains(&indexed.normalized_path) {
                 activate(session_id, &indexed.rule, &indexed.contents);
             }
         }
@@ -104,10 +100,6 @@ fn matches_format(path: &Path, formats: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
 pub fn scan_text_for_file_content(text: &str, active: &[ActiveFileContent]) -> String {
     let mut result = text.to_string();
     for item in active {
@@ -119,7 +111,9 @@ pub fn scan_text_for_file_content(text: &str, active: &[ActiveFileContent]) -> S
             if !super::rg::find_matching_needles(&result, &needles).is_empty() {
                 result = match item.rule.match_mode {
                     MatchMode::Full => result.replace(&file.text, &sanitize_whole(&file.text)),
-                    MatchMode::Fragment => apply_fragment_matches(&result, &file.text, &item.rule),
+                    MatchMode::Fragment => {
+                        apply_fragment_matches(&result, &file.text, &item.rule)
+                    }
                 };
             }
         }
@@ -128,7 +122,13 @@ pub fn scan_text_for_file_content(text: &str, active: &[ActiveFileContent]) -> S
 }
 
 fn apply_fragment_matches(text: &str, needle: &str, rule: &FileRule) -> String {
-    let min_len = rule.min_fragment_len.unwrap_or(12).max(4);
+    let min_len = crate::dlp::fragment::effective_min_fragment_len(
+        needle.chars().count(),
+        rule.min_fragment_len,
+        rule.min_fragment_ratio,
+    )
+    .max(4);
+
     if needle.chars().count() < min_len {
         return text.to_string();
     }
@@ -139,6 +139,14 @@ fn apply_fragment_matches(text: &str, needle: &str, rule: &FileRule) -> String {
 
     for window in 0..max_window {
         for len in min_len..=(max_window - window) {
+            if !fragment_meets_threshold(
+                needle.chars().count(),
+                len,
+                rule.min_fragment_len,
+                rule.min_fragment_ratio,
+            ) {
+                continue;
+            }
             let fragment: String = needle_chars[window..window + len].iter().collect();
             while let Some(pos) = result.find(&fragment) {
                 let char_start = result[..pos].chars().count();

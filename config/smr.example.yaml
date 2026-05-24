@@ -3,8 +3,10 @@ server:
   default_fallback_group: high
 
 pipeline:
+  security_enabled: true
   dlp_enabled: true
   operation_security_mode: observe  # observe | enforce
+  builtin_credential_presets: true
 
 logging:
   level: info

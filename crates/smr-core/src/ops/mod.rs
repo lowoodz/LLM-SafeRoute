@@ -42,12 +42,32 @@ impl OperationSecurity {
         &self,
         extracted: &[ExtractedText],
     ) -> anyhow::Result<Vec<(ExtractedText, String)>> {
+        let (replacements, _, _) = self.process_fields_with_mode(extracted)?;
+        Ok(replacements)
+    }
+
+    pub fn process_fields(
+        &self,
+        extracted: &[ExtractedText],
+    ) -> anyhow::Result<Vec<(ExtractedText, String)>> {
+        self.process_fields_with_mode(extracted)
+            .map(|(r, _, _)| r)
+    }
+
+    pub fn process_fields_with_mode(
+        &self,
+        extracted: &[ExtractedText],
+    ) -> anyhow::Result<(Vec<(ExtractedText, String)>, u32, u32)> {
         let mut replacements = Vec::new();
+        let mut blocks = 0u32;
+        let mut observes = 0u32;
         for item in extracted {
             if let Some(blocked) = self.check_text(&item.text) {
                 if self.mode == OperationSecurityMode::Enforce {
                     replacements.push((item.clone(), blocked));
+                    blocks += 1;
                 } else {
+                    observes += 1;
                     tracing::warn!(
                         rule_id = %self.last_matched_rule_id(&item.text).unwrap_or_default(),
                         "operation security observe: dangerous output detected"
@@ -55,7 +75,7 @@ impl OperationSecurity {
                 }
             }
         }
-        Ok(replacements)
+        Ok((replacements, blocks, observes))
     }
 
     fn last_matched_rule_id(&self, text: &str) -> Option<String> {

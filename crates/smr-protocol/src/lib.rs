@@ -1,10 +1,19 @@
 pub mod body;
 pub mod convert;
 pub mod protocol;
+pub mod unified;
 
 pub use body::{
-    extract_texts, inject_response_texts, inject_texts, parse_json_body, serialize_json_body,
-    ExtractedText, TextPointer,
+    extract_texts, extract_tool_call_texts, filter_tool_related, inject_response_texts,
+    inject_texts, is_tool_related, parse_json_body, serialize_json_body, ExtractedText,
+    TextPointer,
 };
-pub use convert::{anthropic_to_openai, openai_to_anthropic, target_path};
+pub use convert::{
+    anthropic_response_to_openai, anthropic_to_openai, openai_response_to_anthropic,
+    openai_to_anthropic, target_path,
+};
 pub use protocol::{detect_protocol, ApiProtocol};
+pub use unified::{
+    body_to_unified, convert_body, provider_for, unified_to_body, AnthropicProvider,
+    OpenAiProvider, ProviderAdapter, UnifiedRequest,
+};

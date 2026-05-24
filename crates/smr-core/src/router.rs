@@ -9,6 +9,7 @@ use hyper::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use serde_json::Value;
 use smr_protocol::ApiProtocol;
 use tracing::{info, warn};
 
@@ -22,6 +23,21 @@ pub struct Router {
     client: HttpClient,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForwardOptions {
+    pub wants_stream: bool,
+    pub client_protocol: ApiProtocol,
+}
+
+impl Default for ForwardOptions {
+    fn default() -> Self {
+        Self {
+            wants_stream: false,
+            client_protocol: ApiProtocol::OpenAi,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RouteAttempt {
     pub endpoint: ModelEndpoint,
@@ -30,42 +46,74 @@ pub struct RouteAttempt {
     pub headers: HeaderMap,
 }
 
+#[derive(Debug)]
+pub struct RouteResult {
+    pub attempt: RouteAttempt,
+    pub fallback_chain: Vec<String>,
+    pub group_name: String,
+}
+
 impl Router {
     pub fn new(config: Arc<AppConfig>) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self { config, client }
     }
 
-    pub fn resolve_group<'a>(&'a self, group_name: Option<&str>) -> Result<&'a [ModelEndpoint]> {
-        let name = group_name.unwrap_or(&self.config.server.default_fallback_group);
+    pub fn resolve_group(&self, group_name: Option<&str>) -> Result<(String, Vec<ModelEndpoint>)> {
+        let name = group_name
+            .unwrap_or(&self.config.server.default_fallback_group)
+            .to_string();
         self.config
             .fallback_groups
-            .get(name)
-            .map(|v| v.as_slice())
+            .get(&name)
+            .cloned()
+            .map(|v| (name.clone(), v))
             .ok_or_else(|| anyhow!("unknown fallback group: {name}"))
     }
 
     pub async fn forward_with_fallback(
         &self,
+        group_name: &str,
         group: &[ModelEndpoint],
         req: ForwardRequest<'_>,
-    ) -> Result<RouteAttempt> {
-        let mut last_error = None;
+        opts: ForwardOptions,
+    ) -> Result<RouteResult> {
+        let mut last_error: Option<RouteAttempt> = None;
+        let mut chain: Vec<String> = Vec::new();
 
         for (idx, endpoint) in group.iter().enumerate() {
+            chain.push(endpoint.model.clone());
             match self.forward_once(endpoint, &req).await {
-                Ok(attempt) if should_fallback(attempt.status) => {
+                Ok(attempt) if should_fallback_status(attempt.status) => {
                     warn!(
                         model = %endpoint.model,
                         status = %attempt.status,
                         attempt = idx + 1,
-                        "fallback triggered"
+                        "fallback triggered (status)"
                     );
+                    last_error = Some(attempt);
+                }
+                Ok(attempt)
+                    if is_malformed_success(&attempt.status, &attempt.headers, &attempt.body) =>
+                {
+                    warn!(model = %endpoint.model, "fallback triggered (malformed response)");
+                    last_error = Some(attempt);
+                }
+                Ok(attempt)
+                    if opts.wants_stream
+                        && is_sse(&attempt.headers)
+                        && !sse_has_first_token(&attempt.body) =>
+                {
+                    warn!(model = %endpoint.model, "fallback triggered (stream: no first token)");
                     last_error = Some(attempt);
                 }
                 Ok(attempt) => {
                     info!(model = %endpoint.model, status = %attempt.status, "request routed");
-                    return Ok(attempt);
+                    return Ok(RouteResult {
+                        attempt,
+                        fallback_chain: chain,
+                        group_name: group_name.to_string(),
+                    });
                 }
                 Err(err) => {
                     warn!(model = %endpoint.model, error = %err, attempt = idx + 1, "request failed");
@@ -79,7 +127,27 @@ impl Router {
             }
         }
 
-        last_error.ok_or_else(|| anyhow!("no endpoints configured in fallback group"))
+        if let Some(last) = last_error {
+            let msg = format!(
+                "SecureModelRoute: fallback group '{}' exhausted — tried {} endpoint(s): {}. Last status: {}.",
+                group_name,
+                chain.len(),
+                chain.join(" → "),
+                last.status
+            );
+            return Ok(RouteResult {
+                attempt: RouteAttempt {
+                    endpoint: last.endpoint,
+                    status: StatusCode::BAD_GATEWAY,
+                    body: Bytes::from(msg),
+                    headers: HeaderMap::new(),
+                },
+                fallback_chain: chain,
+                group_name: group_name.to_string(),
+            });
+        }
+
+        Err(anyhow!("no endpoints configured in fallback group '{group_name}'"))
     }
 
     async fn forward_once(
@@ -152,8 +220,90 @@ impl Router {
     }
 }
 
-fn should_fallback(status: StatusCode) -> bool {
+pub fn convert_response_body(
+    body: &Bytes,
+    from: ApiProtocol,
+    to: ApiProtocol,
+) -> Result<Bytes> {
+    if from == to || body.is_empty() {
+        return Ok(body.clone());
+    }
+    let json: Value = serde_json::from_slice(body).context("parse response json")?;
+    let converted = match (from, to) {
+        (ApiProtocol::Anthropic, ApiProtocol::OpenAi) => smr_protocol::anthropic_response_to_openai(&json),
+        (ApiProtocol::OpenAi, ApiProtocol::Anthropic) => smr_protocol::openai_response_to_anthropic(&json),
+        _ => json,
+    };
+    Ok(Bytes::from(serde_json::to_vec(&converted)?))
+}
+
+fn should_fallback_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn is_malformed_success(status: &StatusCode, headers: &HeaderMap, body: &Bytes) -> bool {
+    if !status.is_success() || body.is_empty() {
+        return false;
+    }
+    let is_json = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/json"))
+        .unwrap_or(false);
+    if is_json {
+        return serde_json::from_slice::<Value>(body).is_err();
+    }
+    false
+}
+
+fn is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+pub fn sse_has_first_token(body: &[u8]) -> bool {
+    for line in String::from_utf8_lossy(body).lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            if sse_chunk_has_content(&v) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn sse_chunk_has_content(v: &Value) -> bool {
+    if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+        for c in choices {
+            if c.get("delta")
+                .and_then(|d| d.get("content"))
+                .and_then(|t| t.as_str())
+                .is_some_and(|s| !s.is_empty())
+            {
+                return true;
+            }
+            if c.get("delta").and_then(|d| d.get("tool_calls")).is_some() {
+                return true;
+            }
+        }
+    }
+    if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+        return true;
+    }
+  if v.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()).is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
+    false
 }
 
 fn infer_endpoint_protocol(endpoint: &ModelEndpoint) -> ApiProtocol {
@@ -212,4 +362,21 @@ fn copy_forward_headers(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_sse_first_token() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        assert!(sse_has_first_token(body));
+    }
+
+    #[test]
+    fn no_token_in_empty_sse() {
+        let body = b"data: [DONE]\n\n";
+        assert!(!sse_has_first_token(body));
+    }
 }

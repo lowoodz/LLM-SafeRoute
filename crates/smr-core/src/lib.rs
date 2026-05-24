@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod audit;
 pub mod config;
 pub mod dlp;
 pub mod events;
@@ -10,6 +11,7 @@ pub mod request;
 pub mod router;
 pub mod server;
 pub mod state;
+pub mod storage;
 pub mod streaming;
 
 pub use config::AppConfig;

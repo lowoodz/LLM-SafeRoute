@@ -146,6 +146,86 @@ pub fn target_path(source_path: &str, to_anthropic: bool) -> String {
     "/v1/chat/completions".to_string()
 }
 
+/// Convert Anthropic /v1/messages JSON response to OpenAI chat/completions shape.
+pub fn anthropic_response_to_openai(body: &Value) -> Value {
+    if body.get("choices").is_some() {
+        return body.clone();
+    }
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+        for b in content {
+            match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => text.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                "tool_use" => tool_calls.push(serde_json::json!({
+                    "id": b.get("id").cloned().unwrap_or(serde_json::json!("tool")),
+                    "type": "function",
+                    "function": {
+                        "name": b.get("name").cloned().unwrap_or(serde_json::json!("")),
+                        "arguments": b.get("input").cloned().unwrap_or(serde_json::json!({})).to_string()
+                    }
+                })),
+                _ => {}
+            }
+        }
+    }
+    let mut message = serde_json::json!({"role": "assistant", "content": text});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::json!(tool_calls);
+    }
+    serde_json::json!({
+        "id": body.get("id").cloned().unwrap_or(serde_json::json!("smr-converted")),
+        "object": "chat.completion",
+        "model": body.get("model").cloned().unwrap_or(serde_json::json!("")),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": body.get("stop_reason").cloned().unwrap_or(serde_json::json!("stop"))
+        }]
+    })
+}
+
+/// Convert OpenAI chat/completions response to Anthropic message shape.
+pub fn openai_response_to_anthropic(body: &Value) -> Value {
+    if body.get("content").is_some() && body.get("role").is_some() {
+        return body.clone();
+    }
+    let mut blocks = Vec::new();
+    if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
+        if let Some(msg) = choices.first().and_then(|c| c.get("message")) {
+            if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                }
+            }
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tool_calls {
+                    let args = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("{}");
+                    let input: Value = serde_json::from_str(args).unwrap_or(serde_json::json!(args));
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.get("id").cloned().unwrap_or(serde_json::json!("tool")),
+                        "name": tc.get("function").and_then(|f| f.get("name")).cloned().unwrap_or(serde_json::json!("")),
+                        "input": input
+                    }));
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "id": body.get("id").cloned().unwrap_or(serde_json::json!("smr-converted")),
+        "type": "message",
+        "role": "assistant",
+        "model": body.get("model").cloned().unwrap_or(serde_json::json!("")),
+        "content": blocks,
+        "stop_reason": "end_turn"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
