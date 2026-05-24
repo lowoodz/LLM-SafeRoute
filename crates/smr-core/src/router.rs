@@ -6,6 +6,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -17,7 +18,25 @@ use crate::config::{AppConfig, ModelEndpoint};
 use crate::request::ForwardRequest;
 use crate::sse_stream::{collect_sse_for_routing, SseCollectResult, SsePassthroughStream};
 
-type HttpClient = Client<HttpConnector, Full<Bytes>>;
+type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+fn build_http_client() -> HttpClient {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("install rustls crypto provider");
+    });
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let https = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("load native TLS roots")
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Client::builder(TokioExecutor::new()).build(https)
+}
 
 pub struct Router {
     config: Arc<AppConfig>,
@@ -79,7 +98,7 @@ pub struct RouteResult {
 
 impl Router {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        let client = build_http_client();
         Self { config, client }
     }
 
@@ -203,6 +222,7 @@ impl Router {
         }
 
         let base = endpoint.base_url.trim_end_matches('/');
+        path = normalize_upstream_path(base, &path);
         let mut url = format!("{base}{path}");
         if let Some(q) = req.query {
             if !q.is_empty() {
@@ -351,6 +371,14 @@ fn sse_chunk_has_content(v: &Value) -> bool {
     false
 }
 
+fn normalize_upstream_path(base: &str, path: &str) -> String {
+    // GLM coding API: .../v4 + /v1/chat/completions -> .../v4/chat/completions
+    if base.ends_with("/v4") && path.starts_with("/v1/") {
+        return path.replacen("/v1", "", 1);
+    }
+    path.to_string()
+}
+
 fn patch_model_in_body(body: Bytes, model: &str) -> Result<Bytes> {
     if body.is_empty() {
         return Ok(body);
@@ -414,5 +442,14 @@ mod tests {
     fn no_token_in_empty_sse() {
         let body = b"data: [DONE]\n\n";
         assert!(!sse_has_first_token(body));
+    }
+
+    #[test]
+    fn normalizes_v4_openai_path() {
+        let path = normalize_upstream_path(
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+            "/v1/chat/completions",
+        );
+        assert_eq!(path, "/chat/completions");
     }
 }
