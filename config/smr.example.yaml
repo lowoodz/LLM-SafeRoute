@@ -71,3 +71,17 @@ operation_rules:
     object:
       pattern: "https://prod.example.com"
       is_regex: false
+
+path_protection_rules:
+  - id: protect-etc-passwd
+    enabled: true
+    path: "/etc/passwd"
+    level: deny_access
+  - id: protect-var-log
+    enabled: true
+    path: "/var/log"
+    level: deny_modify
+  - id: protect-backups
+    enabled: true
+    path: "/data/backups"
+    level: deny_delete

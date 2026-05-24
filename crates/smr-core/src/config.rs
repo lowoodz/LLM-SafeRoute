@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub file_rules: Vec<FileRule>,
     #[serde(default)]
     pub operation_rules: Vec<OperationRule>,
+    #[serde(default)]
+    pub path_protection_rules: Vec<PathProtectionRule>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -245,6 +247,28 @@ pub struct OperationObject {
     pub pattern: String,
     #[serde(default)]
     pub is_regex: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PathProtectionRule {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub level: PathProtectionLevel,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PathProtectionLevel {
+    /// Block delete/remove operations only.
+    DenyDelete,
+    /// Block delete and write/modify operations.
+    DenyModify,
+    /// Block delete, modify, and read/list/access operations.
+    #[default]
+    DenyAccess,
 }
 
 impl AppConfig {

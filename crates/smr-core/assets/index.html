@@ -81,6 +81,7 @@
   <button class="active" data-tab="overview" onclick="showTab('overview',this)">概览</button>
   <button data-tab="routing" onclick="showTab('routing',this)">模型路由</button>
   <button data-tab="dlp" onclick="showTab('dlp',this)">数据防泄露</button>
+  <button data-tab="path-protection" onclick="showTab('path-protection',this)">重要路径防护</button>
   <button data-tab="ops" onclick="showTab('ops',this)">操作拦截</button>
   <button data-tab="logs" onclick="showTab('logs',this)">日志</button>
   <button data-tab="advanced" onclick="showTab('advanced',this)">高级 YAML</button>
@@ -102,8 +103,27 @@
   <div class="card"><h3>文件保护区</h3><div class="dropzone" id="fileDrop">拖入文件或文件夹路径（也可输入后回车）</div><input id="filePathInput" placeholder="/path/to/secrets" onkeydown="if(event.key==='Enter')addFileRule()" /><button class="primary" onclick="addFileRule()">添加</button><div id="fileRulesList"></div></div>
   <div class="card"><h3>密词标签</h3><input id="secretInput" placeholder="输入敏感词/API Key 后回车" onkeydown="if(event.key==='Enter')addSecretTag()" /><div class="tags" id="secretTags"></div><button class="primary" onclick="saveConfig()">保存 DLP</button></div>
 </section>
+<section class="panel" id="path-protection">
+  <div class="card">
+    <h3>重要路径防护</h3>
+    <p class="hint">拦截 Agent 对重要路径的删除、修改或访问操作。目录路径自动覆盖其子路径。</p>
+    <div class="dropzone" id="pathDrop">拖入文件或文件夹路径（也可输入后添加）</div>
+    <div style="display:flex;gap:8px;margin:8px 0">
+      <input id="pathProtectInput" placeholder="/path/to/protect" onkeydown="if(event.key==='Enter')addPathRule()" />
+      <select id="pathProtectLevel" style="width:140px;flex-shrink:0">
+        <option value="deny_access">禁止访问</option>
+        <option value="deny_modify">禁止修改</option>
+        <option value="deny_delete">禁止删除</option>
+      </select>
+      <button class="primary" onclick="addPathRule()" style="flex-shrink:0">添加</button>
+    </div>
+    <table><thead><tr><th>路径</th><th>防护级别</th><th></th></tr></thead><tbody id="pathProtectTable"></tbody></table>
+    <button class="primary" onclick="saveConfig()">保存路径防护</button>
+  </div>
+</section>
 <section class="panel" id="ops">
-  <div class="card"><table><thead><tr><th>行为</th><th>关键字</th><th></th></tr></thead><tbody id="opsTable"></tbody></table>
+  <div class="card"><h3>操作规则</h3><p class="hint">按操作类型 + 关键字拦截危险 tool 调用（命令 / API / 网络）。</p>
+  <table><thead><tr><th>行为</th><th>关键字</th><th></th></tr></thead><tbody id="opsTable"></tbody></table>
   <button class="primary" onclick="addOpRule()">+ 添加规则</button><button class="primary" onclick="saveConfig()">保存</button></div>
 </section>
 <section class="panel" id="logs">
@@ -120,7 +140,7 @@ let cfg={};
 function showTab(id,btn){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));document.getElementById(id).classList.add('active');btn.classList.add('active');}
 function inferProto(url){return (url||'').includes('anthropic')?'anthropic':'openai';}
 async function loadStatus(){const s=await(await fetch('/api/status')).json();statusText.textContent='运行中 · '+s.listen;proxyUrl.textContent=s.proxy_url;defaultGroup.textContent=s.default_group;dlpStatus.textContent=s.dlp_enabled?'已启用':'已关闭';opMode.textContent=s.operation_mode;indexStatus.textContent=s.file_index_ready?'就绪':'索引中...';securityMaster.checked=s.security_enabled;}
-async function loadConfig(){cfg=await(await fetch('/api/config')).json();configEditor.value=JSON.stringify(cfg,null,2);securityMaster.checked=cfg.pipeline?.security_enabled!==false;renderGroups();renderFileRules();renderSecretTags();renderOps();}
+async function loadConfig(){cfg=await(await fetch('/api/config')).json();configEditor.value=JSON.stringify(cfg,null,2);securityMaster.checked=cfg.pipeline?.security_enabled!==false;renderGroups();renderFileRules();renderSecretTags();renderPathRules();renderOps();}
 function renderGroups(){const g=groupGrid;g.innerHTML='';const groups=cfg.fallback_groups||{};for(const name of ['high','medium','low']){const card=document.createElement('div');card.className='group-card';const title=document.createElement('h4');title.textContent=(name==='high'?'高精度':name==='medium'?'平衡':'轻量')+(name===cfg.server?.default_fallback_group?' ★':'');card.appendChild(title);const list=document.createElement('div');list.dataset.group=name;list.ondragover=e=>e.preventDefault();list.ondrop=e=>dropModel(e,name);(groups[name]||[]).forEach((m,i)=>list.appendChild(modelRow(m,i,name)));card.appendChild(list);const add=document.createElement('button');add.className='secondary';add.textContent='+ 添加模型';add.onclick=()=>addModel(name);card.appendChild(add);g.appendChild(card);}}
 function modelRow(m,i,group){const row=document.createElement('div');row.className='model-row';row.draggable=true;row.dataset.group=group;row.dataset.index=i;row.ondragstart=e=>{e.dataTransfer.setData('text',JSON.stringify({group,index:i}));row.classList.add('dragging');};row.ondragend=()=>row.classList.remove('dragging');const proto=inferProto(m.base_url);row.innerHTML=`<span class="proto ${proto}">${proto==='openai'?'🟢 OpenAI':'🔵 Anthropic'}</span><span>${i+1}. ${m.model}</span>`;return row;}
 function dropModel(e,group){e.preventDefault();const d=JSON.parse(e.dataTransfer.getData('text'));const arr=cfg.fallback_groups[d.group];const[item]=arr.splice(d.index,1);if(!cfg.fallback_groups[group])cfg.fallback_groups[group]=[];cfg.fallback_groups[group].push(item);renderGroups();}
@@ -130,6 +150,8 @@ function addFileRule(){const p=filePathInput.value.trim();if(!p)return;cfg.file_
 function renderSecretTags(){secretTags.innerHTML='';(cfg.content_rules||[]).filter(r=>r.enabled).forEach((r,i)=>{const t=document.createElement('div');t.className='tag';t.innerHTML=`${r.value.slice(0,20)}${r.value.length>20?'…':''} <span onclick="removeSecret(${i})">×</span>`;secretTags.appendChild(t);});}
 function addSecretTag(){const v=secretInput.value.trim();if(!v)return;cfg.content_rules=cfg.content_rules||[];cfg.content_rules.push({id:'secret-'+Date.now(),enabled:true,match_mode:'full',category:'secret',value:v});secretInput.value='';renderSecretTags();}
 function removeSecret(i){const rules=(cfg.content_rules||[]).filter(r=>r.enabled);rules[i].enabled=false;renderSecretTags();}
+function renderPathRules(){pathProtectTable.innerHTML='';(cfg.path_protection_rules||[]).forEach((r,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td><input value="${r.path||''}" onchange="cfg.path_protection_rules[${i}].path=this.value"/></td><td><select onchange="cfg.path_protection_rules[${i}].level=this.value"><option value="deny_delete" ${r.level==='deny_delete'?'selected':''}>禁止删除</option><option value="deny_modify" ${r.level==='deny_modify'?'selected':''}>禁止修改</option><option value="deny_access" ${r.level==='deny_access'?'selected':''}>禁止访问</option></select></td><td><button class="secondary" onclick="cfg.path_protection_rules.splice(${i},1);renderPathRules()">删除</button></td>`;pathProtectTable.appendChild(tr);});}
+function addPathRule(){const p=(pathProtectInput.value||'').trim();if(!p)return;cfg.path_protection_rules=cfg.path_protection_rules||[];cfg.path_protection_rules.push({id:'path-'+Date.now(),enabled:true,path:p,level:pathProtectLevel.value});pathProtectInput.value='';renderPathRules();}
 function renderOps(){opsTable.innerHTML='';(cfg.operation_rules||[]).forEach((r,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td><select onchange="cfg.operation_rules[${i}].operation=this.value"><option value="command_exec" ${r.operation==='command_exec'?'selected':''}>命令</option><option value="api_call" ${r.operation==='api_call'?'selected':''}>API</option><option value="network_access" ${r.operation==='network_access'?'selected':''}>网络</option></select></td><td><input value="${r.object?.pattern||''}" onchange="cfg.operation_rules[${i}].object.pattern=this.value"/></td><td><button class="secondary" onclick="cfg.operation_rules.splice(${i},1);renderOps()">删除</button></td>`;opsTable.appendChild(tr);});}
 function addOpRule(){cfg.operation_rules=cfg.operation_rules||[];cfg.operation_rules.push({id:'op-'+Date.now(),enabled:true,operation:'command_exec',object:{pattern:'',is_regex:false}});renderOps();}
 function toggleSecurity(){cfg.pipeline=cfg.pipeline||{};cfg.pipeline.security_enabled=securityMaster.checked;saveConfig();}
@@ -139,6 +161,7 @@ function copyUrl(){navigator.clipboard.writeText(proxyUrl.textContent);alert('�
 async function loadEvents(){const d=await(await fetch('/api/events?limit=50')).json();logBody.innerHTML='';for(const e of d.events||[]){const k=typeof e.kind==='string'?e.kind:Object.keys(e.kind||{})[0];logBody.innerHTML+=`<tr><td>${(e.timestamp||'').slice(0,19).replace('T',' ')}</td><td>${k}</td><td>${e.message}</td></tr>`;}}
 async function loadAudits(){const d=await(await fetch('/api/audits?limit=30')).json();auditBody.innerHTML='';for(const a of d.audits||[]){auditBody.innerHTML+=`<tr><td>${(a.timestamp||'').slice(0,19).replace('T',' ')}</td><td>${a.protocol} | ${(a.fallback_chain||[]).join('→')} | DLP:${a.dlp_replacements} Safety:${a.safety_blocks}</td></tr>`;}}
 const fileDrop=document.getElementById('fileDrop');fileDrop.ondragover=e=>{e.preventDefault();fileDrop.classList.add('dragover');};fileDrop.ondragleave=()=>fileDrop.classList.remove('dragover');fileDrop.ondrop=e=>{e.preventDefault();fileDrop.classList.remove('dragover');const p=e.dataTransfer.getData('text/plain')||e.dataTransfer.files?.[0]?.path;if(p){filePathInput.value=p;addFileRule();}};
+const pathDrop=document.getElementById('pathDrop');pathDrop.ondragover=e=>{e.preventDefault();pathDrop.classList.add('dragover');};pathDrop.ondragleave=()=>pathDrop.classList.remove('dragover');pathDrop.ondrop=e=>{e.preventDefault();pathDrop.classList.remove('dragover');const p=e.dataTransfer.getData('text/plain')||e.dataTransfer.files?.[0]?.path;if(p){pathProtectInput.value=p;addPathRule();}};
 loadStatus();loadConfig();loadEvents();loadAudits();setInterval(()=>{loadEvents();loadAudits();},8000);
 </script>
 </body>

@@ -31,10 +31,11 @@ impl AppEngines {
             ops: Arc::new(if ops_enabled {
                 OperationSecurity::new(
                     &config.operation_rules,
+                    &config.path_protection_rules,
                     config.pipeline.operation_security_mode,
                 )?
             } else {
-                OperationSecurity::new(&[], config.pipeline.operation_security_mode)?
+                OperationSecurity::new(&[], &[], config.pipeline.operation_security_mode)?
             }),
             router: Arc::new(Router::new(config_arc)),
             config,

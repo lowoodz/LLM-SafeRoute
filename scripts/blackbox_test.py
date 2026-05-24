@@ -169,6 +169,12 @@ operation_rules:
       pattern: "rm -rf"
       is_regex: false
 
+path_protection_rules:
+  - id: blackbox-protected-dir
+    enabled: true
+    path: "{secrets}"
+    level: deny_access
+
 file_rules:
   - id: blackbox-secrets
     enabled: true
@@ -541,6 +547,35 @@ def scenario_request_ops_block(report: Report) -> None:
     report.add(story, "request_ops_block", blocks > 0, f"status={code}, blocks={blocks}", ms)
 
 
+def scenario_path_protection(report: Report, secrets_dir: Path) -> None:
+    story = "Agent：路径防护"
+    path_str = str(secrets_dir / "project.txt").replace("\\", "/")
+    body = {
+        "model": "glm-4-flash",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": path_str}),
+                        },
+                    }
+                ],
+            }
+        ],
+        "max_tokens": 8,
+    }
+    code, _, ms = http("POST", f"{BASE}/v1/chat/completions", body=body)
+    audit = latest_audit(BASE)
+    blocks = int(audit.get("safety_blocks", 0)) if audit else 0
+    report.add(story, "path_protection_deny_access", blocks > 0, f"status={code}, blocks={blocks}", ms)
+
+
 def scenario_response_ops_block(report: Report) -> None:
     story = "Agent：危险 tool（响应侧 JSON）"
     code, text, ms = chat_openai(
@@ -837,6 +872,7 @@ def main() -> int:
         scenario_file_session_guard(report, secrets_dir)
         scenario_session_window_exhaustion(report, secrets_dir)
         scenario_request_ops_block(report)
+        scenario_path_protection(report, secrets_dir)
         scenario_response_ops_block(report)
         scenario_streaming_ops_block(report)
         scenario_stream_fallback_no_token(report)

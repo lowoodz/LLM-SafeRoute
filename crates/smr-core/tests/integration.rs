@@ -66,6 +66,7 @@ fn test_config(upstream_base: &str) -> AppConfig {
                 is_regex: false,
             },
         }],
+        path_protection_rules: vec![],
     }
 }
 
@@ -285,6 +286,7 @@ fn config_validation_rejects_empty_groups() {
         content_rules: vec![],
         file_rules: vec![],
         operation_rules: vec![],
+        path_protection_rules: vec![],
     };
     assert!(config.validate().is_err());
     config.fallback_groups.insert("high".into(), vec![]);

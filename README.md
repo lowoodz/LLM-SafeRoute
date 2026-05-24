@@ -9,6 +9,7 @@
 | **大模型路由** | 高/中/低多组 fallback，组内自动切换；OpenAI / Anthropic 协议自动检测与跨协议转换 |
 | **DLP（请求侧）** | 内容规则 + 文件路径规则（txt/md/docx/pdf/pptx），SessionGuard 触发窗口 |
 | **操作安全（响应侧）** | 检查模型返回 tool_calls，observe / enforce 模式 |
+| **路径防护** | 按路径配置禁止删除 / 修改 / 访问，复用操作安全拦截 |
 | **Web GUI** | 概览 / 路由 / 配置 / 日志，保存即热加载 |
 | **桌面 GUI（可选）** | Tauri 原生窗口，内嵌管理界面 |
 | **SSE 流式** | 流式响应中的 tool_calls 安全检查 |

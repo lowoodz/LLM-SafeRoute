@@ -1,10 +1,14 @@
 use regex::Regex;
 
-use crate::config::{OperationRule, OperationSecurityMode, OperationType};
+use crate::config::{OperationRule, OperationSecurityMode, OperationType, PathProtectionRule};
 use smr_protocol::ExtractedText;
+
+mod path_protection;
+use path_protection::{level_label, PathProtection};
 
 pub struct OperationSecurity {
     rules: Vec<CompiledRule>,
+    path_protection: PathProtection,
     mode: OperationSecurityMode,
 }
 
@@ -19,7 +23,11 @@ enum Matcher {
 }
 
 impl OperationSecurity {
-    pub fn new(rules: &[OperationRule], mode: OperationSecurityMode) -> anyhow::Result<Self> {
+    pub fn new(
+        rules: &[OperationRule],
+        path_rules: &[PathProtectionRule],
+        mode: OperationSecurityMode,
+    ) -> anyhow::Result<Self> {
         let mut compiled = Vec::new();
         for rule in rules.iter().filter(|r| r.enabled) {
             let matcher = if rule.object.is_regex {
@@ -34,6 +42,7 @@ impl OperationSecurity {
         }
         Ok(Self {
             rules: compiled,
+            path_protection: PathProtection::new(path_rules),
             mode,
         })
     }
@@ -97,6 +106,17 @@ impl OperationSecurity {
                 return Some(wrap_blocked_payload(text, &msg, compiled.rule.operation));
             }
         }
+
+        if let Some((rule_id, level, path)) = self.path_protection.check(text) {
+            let msg = format!(
+                "[SMR BLOCKED] 路径防护「{}」已拦截对 {} 的操作。规则 ID: {}",
+                level_label(level),
+                path,
+                rule_id
+            );
+            return Some(wrap_blocked_payload(text, &msg, OperationType::CommandExec));
+        }
+
         None
     }
 
@@ -168,7 +188,7 @@ mod tests {
                 is_regex: false,
             },
         }];
-        let ops = OperationSecurity::new(&rules, OperationSecurityMode::Enforce).unwrap();
+        let ops = OperationSecurity::new(&rules, &[], OperationSecurityMode::Enforce).unwrap();
         let extracted = vec![ExtractedText {
             pointer: smr_protocol::TextPointer::OpenAiToolCallArguments {
                 message_index: 0,
@@ -179,5 +199,33 @@ mod tests {
         let out = ops.process_response(&extracted).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].1.contains("SMR BLOCKED"));
+    }
+
+    #[test]
+    fn path_protection_blocks_via_ops_engine() {
+        use crate::config::{PathProtectionLevel, PathProtectionRule};
+        use std::path::PathBuf;
+
+        let ops = OperationSecurity::new(
+            &[],
+            &[PathProtectionRule {
+                id: "vault".into(),
+                enabled: true,
+                path: PathBuf::from("/secure/vault"),
+                level: PathProtectionLevel::DenyAccess,
+            }],
+            OperationSecurityMode::Enforce,
+        )
+        .unwrap();
+        let extracted = vec![ExtractedText {
+            pointer: smr_protocol::TextPointer::OpenAiToolCallArguments {
+                message_index: 0,
+                tool_index: 0,
+            },
+            text: r#"{"path":"/secure/vault/secret.txt"}"#.into(),
+        }];
+        let out = ops.process_fields(&extracted).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.contains("路径防护"));
     }
 }
