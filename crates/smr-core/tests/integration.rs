@@ -120,6 +120,84 @@ async fn spawn_mock_upstream(dangerous: bool) -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_malformed_upstream() -> String {
+    async fn handler() -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{not-valid-json"))
+            .unwrap()
+    }
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(handler),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn malformed_json_triggers_fallback() {
+    let bad = spawn_malformed_upstream().await;
+    let good = spawn_mock_upstream(false).await;
+
+    let mut groups = HashMap::new();
+    groups.insert(
+        "high".to_string(),
+        vec![
+            ModelEndpoint {
+                id: "bad".into(),
+                base_url: bad,
+                model: "bad-model".into(),
+                api_key: Some("k".into()),
+                api_key_env: None,
+                timeout_secs: 5,
+                protocol: None,
+            },
+            ModelEndpoint {
+                id: "good".into(),
+                base_url: good,
+                model: "mock-model".into(),
+                api_key: Some("k".into()),
+                api_key_env: None,
+                timeout_secs: 10,
+                protocol: None,
+            },
+        ],
+    );
+
+    let mut config = test_config("http://127.0.0.1:9");
+    config.fallback_groups = groups;
+
+    let (_app, proxy) = make_app(config);
+
+    let body = serde_json::json!({
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+
+    let (status, _, resp_body) = proxy
+        .handle_api_request(ProxyRequest {
+            session_id: "sess-malformed",
+            fallback_group: Some("high"),
+            method: Method::POST,
+            path: "/v1/chat/completions",
+            query: None,
+            headers,
+            body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+        })
+        .await
+        .unwrap();
+
+    assert!(status.is_success());
+    assert!(serde_json::from_slice::<serde_json::Value>(&extract_body_bytes(resp_body)).is_ok());
+}
+
 #[tokio::test]
 async fn dlp_and_route_work() {
     let upstream = spawn_mock_upstream(false).await;

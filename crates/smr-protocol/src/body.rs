@@ -12,6 +12,7 @@ pub enum TextPointer {
     OpenAiMessageContent { message_index: usize },
     OpenAiMessageString { message_index: usize },
     OpenAiToolCallArguments { message_index: usize, tool_index: usize },
+    OpenAiDeltaToolCallArguments { choice_index: usize, tool_index: usize },
     AnthropicContentBlock { message_index: usize, block_index: usize },
 }
 
@@ -32,7 +33,7 @@ pub fn extract_texts(body: &Value) -> Result<Vec<ExtractedText>> {
     }
 
     if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
-        for choice in choices {
+        for (ci, choice) in choices.iter().enumerate() {
             if let Some(msg) = choice.get("message") {
                 extract_openai_message(msg, 0, &mut out);
             }
@@ -41,6 +42,25 @@ pub fn extract_texts(body: &Value) -> Result<Vec<ExtractedText>> {
                     pointer: TextPointer::OpenAiMessageString { message_index: 0 },
                     text: text.to_string(),
                 });
+            }
+            if let Some(delta) = choice.get("delta") {
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    for (ti, tc) in tool_calls.iter().enumerate() {
+                        if let Some(args) = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                        {
+                            out.push(ExtractedText {
+                                pointer: TextPointer::OpenAiDeltaToolCallArguments {
+                                    choice_index: ci,
+                                    tool_index: ti,
+                                },
+                                text: args.to_string(),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -63,7 +83,8 @@ pub fn extract_tool_call_texts(body: &Value) -> Result<Vec<ExtractedText>> {
 /// Tool-related pointers: OpenAI tool args, Anthropic tool_use / tool_result blocks.
 pub fn is_tool_related(extracted: &ExtractedText, body: &Value) -> bool {
     match &extracted.pointer {
-        TextPointer::OpenAiToolCallArguments { .. } => true,
+        TextPointer::OpenAiToolCallArguments { .. }
+        | TextPointer::OpenAiDeltaToolCallArguments { .. } => true,
         TextPointer::AnthropicContentBlock {
             message_index,
             block_index,
@@ -218,6 +239,20 @@ pub fn inject_texts(body: &mut Value, replacements: &[(ExtractedText, String)]) 
                 body["messages"][*message_index]["tool_calls"][*tool_index]["function"]["arguments"] =
                     json!(new_text);
             }
+            TextPointer::OpenAiDeltaToolCallArguments {
+                choice_index,
+                tool_index,
+            } => {
+                if let Some(choices) = body.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                    if let Some(delta) = choices
+                        .get_mut(*choice_index)
+                        .and_then(|c| c.get_mut("delta"))
+                    {
+                        delta["tool_calls"][*tool_index]["function"]["arguments"] =
+                            json!(new_text);
+                    }
+                }
+            }
             TextPointer::AnthropicContentBlock {
                 message_index,
                 block_index,
@@ -270,6 +305,20 @@ pub fn inject_response_texts(body: &mut Value, replacements: &[(ExtractedText, S
                     }
                 }
             }
+            TextPointer::OpenAiDeltaToolCallArguments {
+                choice_index,
+                tool_index,
+            } => {
+                if let Some(choices) = body.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                    if let Some(delta) = choices
+                        .get_mut(*choice_index)
+                        .and_then(|c| c.get_mut("delta"))
+                    {
+                        delta["tool_calls"][*tool_index]["function"]["arguments"] =
+                            json!(new_text);
+                    }
+                }
+            }
             TextPointer::AnthropicContentBlock { block_index, .. } => {
                 if let Some(content) = body.get_mut("content").and_then(|c| c.as_array_mut()) {
                     inject_anthropic_block(&mut content[*block_index], new_text);
@@ -292,6 +341,28 @@ pub fn serialize_json_body(value: &Value) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn extracts_delta_tool_call_arguments() {
+        let body = json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": r#"{"command":"rm -rf /"}"#}
+                    }]
+                }
+            }]
+        });
+        let extracted = extract_texts(&body).unwrap();
+        let tools: Vec<_> = extracted
+            .iter()
+            .filter(|e| matches!(e.pointer, TextPointer::OpenAiDeltaToolCallArguments { .. }))
+            .collect();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].text.contains("rm -rf"));
+        assert!(is_tool_related(tools[0], &body));
+    }
 
     #[test]
     fn text_blocks_not_marked_tool_related_when_tool_calls_present() {

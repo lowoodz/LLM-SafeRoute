@@ -78,11 +78,18 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="dummy")
 
 ```bash
 export CARGO_TARGET_DIR="$PWD/target"
-cargo test                    # 15 项测试
+cargo test                    # 单元 + 集成测试
 cargo clippy -- -D warnings
-./scripts/verify.sh           # 端到端健康检查
-./scripts/package.sh          # 生成 dist/smr-*.tar.gz
-SMR_BUILD_GUI=1 ./scripts/install.sh  # 含桌面应用
+./scripts/verify.sh           # 单元测试 + 冒烟（health/status/ui）
+
+# 需要 test_model_api_key.txt（gitignore，勿提交）
+python3 scripts/blackbox_test.py   # 黑盒场景（功能/E2E）
+python3 scripts/live_test.py         # 压测（并发 chat + 流式）
+./scripts/run_all_tests.sh           # 以上全部
+
+# 压测参数（可选）
+SMR_STRESS_TOTAL=50 SMR_STRESS_STREAM_TOTAL=20 python3 scripts/live_test.py
+SMR_STRESS_SOAK_SEC=60 python3 scripts/live_test.py   # 附加 soak
 ```
 
 ## 许可证

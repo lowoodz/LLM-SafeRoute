@@ -58,9 +58,8 @@ impl DlpEngine {
             return Ok((Vec::new(), 0));
         }
 
-        self.apply_path_triggers(session_id, request_json);
-
         let session_active = self.sessions.begin_request(session_id);
+        self.apply_path_triggers(session_id, request_json);
         let mut replacements = Vec::new();
         for item in extracted {
             let sanitized = self.sanitize_field(&item.text, session_active.as_deref())?;
@@ -130,6 +129,10 @@ impl DlpEngine {
     }
 
     pub fn is_tool_field(pointer: &TextPointer) -> bool {
-        matches!(pointer, TextPointer::OpenAiToolCallArguments { .. })
+        matches!(
+            pointer,
+            TextPointer::OpenAiToolCallArguments { .. }
+                | TextPointer::OpenAiDeltaToolCallArguments { .. }
+        )
     }
 }
