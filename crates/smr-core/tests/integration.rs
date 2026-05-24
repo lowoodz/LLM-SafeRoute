@@ -176,6 +176,22 @@ fn config_loads_example_yaml() {
     assert!(config.fallback_groups.contains_key("high"));
 }
 
+#[test]
+fn config_validation_rejects_empty_groups() {
+    let mut config = AppConfig {
+        server: ServerConfig::default(),
+        pipeline: PipelineConfig::default(),
+        logging: LoggingConfig::default(),
+        fallback_groups: HashMap::new(),
+        content_rules: vec![],
+        file_rules: vec![],
+        operation_rules: vec![],
+    };
+    assert!(config.validate().is_err());
+    config.fallback_groups.insert("high".into(), vec![]);
+    assert!(config.validate().is_err());
+}
+
 #[tokio::test]
 async fn health_and_ui_endpoints() {
     use smr_core::run_app;

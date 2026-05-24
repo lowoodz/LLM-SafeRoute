@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -44,5 +45,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    run_app(app).await
+    run_with_shutdown(app).await
+}
+
+async fn run_with_shutdown(app: Arc<SharedApp>) -> anyhow::Result<()> {
+    tokio::select! {
+        res = run_app(app) => res,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SecureModelRoute shutting down");
+            Ok(())
+        }
+    }
 }

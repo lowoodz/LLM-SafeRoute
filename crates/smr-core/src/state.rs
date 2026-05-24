@@ -73,6 +73,7 @@ impl SharedApp {
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
+        config.validate()?;
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

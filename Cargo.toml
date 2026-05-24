@@ -4,6 +4,7 @@ members = [
     "crates/smr-protocol",
     "crates/smr-core",
     "crates/smr-cli",
+    "gui/src-tauri",
 ]
 
 [workspace.package]
@@ -42,3 +43,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 parking_lot = "0.12"
 dirs = "6"
 open = "5"
+pdf-extract = "0.7"
+zip = "2"
+quick-xml = "0.37"

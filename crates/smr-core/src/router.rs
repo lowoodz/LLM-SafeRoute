@@ -87,8 +87,30 @@ impl Router {
         endpoint: &ModelEndpoint,
         req: &ForwardRequest<'_>,
     ) -> Result<RouteAttempt> {
+        let target_protocol = infer_endpoint_protocol(endpoint);
+        let mut path = req.path.to_string();
+        let mut body = patch_model_in_body(req.body.clone(), &endpoint.model)?;
+
+        if req.protocol != target_protocol && !body.is_empty() {
+            if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                path = smr_protocol::target_path(&path, target_protocol == ApiProtocol::Anthropic);
+                json = match (req.protocol, target_protocol) {
+                    (ApiProtocol::OpenAi, ApiProtocol::Anthropic) => {
+                        info!(model = %endpoint.model, "converting request OpenAI -> Anthropic");
+                        smr_protocol::openai_to_anthropic(&json)
+                    }
+                    (ApiProtocol::Anthropic, ApiProtocol::OpenAi) => {
+                        info!(model = %endpoint.model, "converting request Anthropic -> OpenAI");
+                        smr_protocol::anthropic_to_openai(&json)
+                    }
+                    _ => json,
+                };
+                body = Bytes::from(serde_json::to_vec(&json)?);
+            }
+        }
+
         let base = endpoint.base_url.trim_end_matches('/');
-        let mut url = format!("{base}{}", req.path);
+        let mut url = format!("{base}{path}");
         if let Some(q) = req.query {
             if !q.is_empty() {
                 url.push('?');
@@ -97,14 +119,13 @@ impl Router {
         }
 
         let uri: hyper::Uri = url.parse().context("invalid upstream url")?;
-        let body = patch_model_in_body(req.body.clone(), &endpoint.model)?;
 
         let mut request = Request::builder()
             .method(req.method.clone())
             .uri(uri)
             .body(Full::new(body))?;
 
-        copy_forward_headers(&req.headers, request.headers_mut(), endpoint, req.protocol)?;
+        copy_forward_headers(&req.headers, request.headers_mut(), endpoint, target_protocol)?;
 
         let response = tokio::time::timeout(
             Duration::from_secs(endpoint.timeout_secs),
@@ -133,6 +154,15 @@ impl Router {
 
 fn should_fallback(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn infer_endpoint_protocol(endpoint: &ModelEndpoint) -> ApiProtocol {
+    let url = endpoint.base_url.to_ascii_lowercase();
+    if url.contains("anthropic.com") {
+        ApiProtocol::Anthropic
+    } else {
+        ApiProtocol::OpenAi
+    }
 }
 
 fn patch_model_in_body(body: Bytes, model: &str) -> Result<Bytes> {

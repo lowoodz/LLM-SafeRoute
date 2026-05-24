@@ -1,4 +1,5 @@
 mod content;
+mod doc_extract;
 mod file;
 mod rg;
 mod sanitize;

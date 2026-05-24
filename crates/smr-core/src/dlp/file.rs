@@ -1,7 +1,6 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use walkdir::WalkDir;
 
 use crate::config::{FileRule, MatchMode};
@@ -93,8 +92,7 @@ pub fn load_rule_contents(rule: &FileRule) -> Result<Vec<FileContent>> {
 }
 
 fn read_text_file(path: &Path) -> Option<String> {
-    fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))
+    super::doc_extract::extract_text(path)
         .map_err(|e| tracing::warn!("{e}"))
         .ok()
 }

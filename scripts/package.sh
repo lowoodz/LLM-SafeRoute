@@ -26,6 +26,14 @@ cp scripts/install.sh "$OUT/install.sh"
 chmod +x "$OUT/install.sh"
 
 tar -czf "$OUT/${PKG}.tar.gz" -C "$OUT" smr smr.example.yaml README.md install.sh
+
+APP_BUNDLE="$ROOT/target/release/bundle/macos/SecureModelRoute.app"
+if [[ -d "$APP_BUNDLE" ]]; then
+  PKG_APP="smr-${VERSION}-${OS}-${ARCH}-app"
+  tar -czf "$OUT/${PKG_APP}.tar.gz" -C "$(dirname "$APP_BUNDLE")" SecureModelRoute.app
+  echo "==> Desktop app: $OUT/${PKG_APP}.tar.gz"
+fi
+
 echo "==> Package: $OUT/${PKG}.tar.gz"
 echo "==> Binary:  $OUT/smr"
 

@@ -181,6 +181,9 @@ fn default_formats() -> Vec<String> {
         "css".into(),
         "xml".into(),
         "csv".into(),
+        "docx".into(),
+        "pptx".into(),
+        "pdf".into(),
     ]
 }
 
@@ -212,6 +215,33 @@ impl AppConfig {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let config: AppConfig = serde_yaml::from_str(&text)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.fallback_groups.is_empty() {
+            anyhow::bail!("fallback_groups must not be empty");
+        }
+        if !self
+            .fallback_groups
+            .contains_key(&self.server.default_fallback_group)
+        {
+            anyhow::bail!(
+                "default_fallback_group '{}' not found in fallback_groups",
+                self.server.default_fallback_group
+            );
+        }
+        for (group, endpoints) in &self.fallback_groups {
+            if endpoints.is_empty() {
+                anyhow::bail!("fallback group '{group}' has no models");
+            }
+            for ep in endpoints {
+                if ep.base_url.is_empty() || ep.model.is_empty() {
+                    anyhow::bail!("endpoint '{}' in group '{group}' missing base_url or model", ep.id);
+                }
+            }
+        }
+        Ok(())
     }
 }
