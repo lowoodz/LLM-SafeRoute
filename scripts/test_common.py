@@ -13,8 +13,26 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-KEYS_FILE = ROOT / "test_model_api_key.txt"
-SMR_BIN = ROOT / "target" / "release" / "smr"
+KEYS_FILE = Path(os.environ.get("SMR_KEYS_FILE", str(ROOT / "test_model_api_key.txt")))
+
+
+def _default_smr_bin() -> Path:
+    override = os.environ.get("SMR_BIN")
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        for candidate in (
+            Path(os.environ.get("USERPROFILE", "")) / ".local" / "bin" / "smr.exe",
+            Path(r"C:\Users\Public\smr-home\bin\smr.exe"),
+            ROOT / "target" / "release" / "smr.exe",
+        ):
+            if candidate.exists():
+                return candidate
+        return ROOT / "target" / "release" / "smr.exe"
+    return ROOT / "target" / "release" / "smr"
+
+
+SMR_BIN = _default_smr_bin()
 
 
 def parse_keys(path: Path = KEYS_FILE) -> tuple[str, str]:
@@ -64,20 +82,26 @@ def start_smr(config_path: Path, cwd: Path = ROOT) -> subprocess.Popen:
     if not SMR_BIN.exists():
         raise SystemExit(f"Missing {SMR_BIN}; run: cargo build --release")
     logf = open(config_path.with_suffix(".log"), "w", encoding="utf-8")
-    return subprocess.Popen(
-        [str(SMR_BIN), "--config", str(config_path)],
-        stdout=logf,
-        stderr=subprocess.STDOUT,
-        cwd=str(cwd),
-        preexec_fn=os.setsid if hasattr(os, "setsid") else None,
-    )
+    kwargs: dict = {
+        "args": [str(SMR_BIN), "--config", str(config_path)],
+        "stdout": logf,
+        "stderr": subprocess.STDOUT,
+        "cwd": str(cwd),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    else:
+        kwargs["preexec_fn"] = os.setsid
+    return subprocess.Popen(**kwargs)
 
 
 def stop_smr(proc: subprocess.Popen | None) -> None:
     if not proc:
         return
     try:
-        if hasattr(os, "killpg"):
+        if os.name == "nt":
+            proc.terminate()
+        elif hasattr(os, "killpg"):
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         else:
             proc.terminate()

@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from test_common import KEYS_FILE, parse_keys, start_smr, stop_smr, wait_ready, http
 
 ROOT = Path(__file__).resolve().parents[1]

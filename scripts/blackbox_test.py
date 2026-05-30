@@ -757,13 +757,20 @@ def scenario_config_reload_preserves_session(report: Report, secrets_dir: Path) 
         headers={"X-SMR-Session-Id": session},
     )
     reload_code, _, _ = http("PUT", f"{BASE}/api/reload")
+    wait_ready(BASE, timeout=30.0, require_file_index=True)
     code, _, ms = chat_openai(
         [{"role": "user", "content": f"after reload {FILE_SECRET}"}],
         session=session,
         max_tokens=16,
     )
-    audit = latest_audit(BASE)
-    dlp = int(audit.get("dlp_replacements", 0)) if audit else 0
+    audit = None
+    dlp = 0
+    for _ in range(5):
+        audit = latest_audit(BASE)
+        dlp = int(audit.get("dlp_replacements", 0)) if audit else 0
+        if dlp > 0:
+            break
+        time.sleep(0.5)
     ok = reload_code == 200 and code == 200 and dlp > 0
     report.add(story, "reload_session_persist", ok, f"reload={reload_code}, dlp={dlp}", ms)
 
