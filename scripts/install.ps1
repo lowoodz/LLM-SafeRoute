@@ -1,10 +1,21 @@
 # Install SecureModelRoute on Windows x86_64.
 param(
     [switch]$Service,
-    [switch]$Gui
+    [switch]$Gui,
+    [switch]$All,
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
+
+function Write-InstallLog($msg) {
+    if (-not $Quiet) { Write-Host $msg }
+}
+
+if ($All) {
+    $Service = $true
+    $Gui = $true
+}
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = if (Test-Path (Join-Path $ScriptDir "smr.exe")) { $ScriptDir } else { Split-Path -Parent $ScriptDir }
@@ -26,7 +37,7 @@ if (-not (Test-Path $SourceExe)) {
     Write-Error "smr.exe not found. Run package.ps1 first or extract the release zip."
 }
 
-Write-Host "==> Installing to $Prefix"
+Write-InstallLog "==> Installing to $Prefix"
 New-Item -ItemType Directory -Force -Path $BinDir, $ConfDir | Out-Null
 Copy-Item $SourceExe $SmrExe -Force
 
@@ -36,7 +47,7 @@ if (-not (Test-Path $Config)) {
         $Example = Join-Path $Root "config\smr.example.yaml"
     }
     Copy-Item $Example $Config -Force
-    Write-Host "    Created $Config"
+    Write-InstallLog "    Created $Config"
 }
 
 @(
@@ -44,43 +55,86 @@ if (-not (Test-Path $Config)) {
     "start `"`" `"$SmrExe`" --config `"$Config`" --open %*"
 ) | Set-Content -Path $Launcher -Encoding ASCII
 
-if ($Gui) {
-    Write-Host "==> Building desktop app (Tauri, requires npm)"
-    $RepoRoot = if (Test-Path (Join-Path $Root "Cargo.toml")) { $Root } else { Split-Path -Parent $Root }
-    $GuiDir = Join-Path $RepoRoot "gui"
-    if ((Get-Command npm -ErrorAction SilentlyContinue) -and (Test-Path $GuiDir)) {
-        Push-Location $GuiDir
-        $env:CARGO_TARGET_DIR = Join-Path $RepoRoot "target"
-        npm ci --silent 2>$null; if ($LASTEXITCODE -ne 0) { npm install --silent }
-        npm run build --silent
-        Pop-Location
-        $AppExe = Get-ChildItem (Join-Path $RepoRoot "target\release") -Filter "SecureModelRoute.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $AppExe) {
-            $AppExe = Get-ChildItem (Join-Path $RepoRoot "target\release") -Filter "securemodelroute.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+function Install-SmrDesktop {
+    param([string]$SearchRoot)
+
+    $DestDir = Join-Path $env:LOCALAPPDATA "Programs\SecureModelRoute"
+    $AppPath = Join-Path $DestDir "SecureModelRoute.exe"
+    $Installed = $false
+
+    $Setup = Get-ChildItem $SearchRoot -Filter "SecureModelRoute-*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Setup) {
+        Write-InstallLog "    Running NSIS installer: $($Setup.Name)"
+        Start-Process -FilePath $Setup.FullName -ArgumentList "/S" -Wait
+        $Installed = $true
+        foreach ($candidate in @(
+            $AppPath,
+            (Join-Path $env:LOCALAPPDATA "Programs\com.securemodelroute.desktop\SecureModelRoute.exe")
+        )) {
+            if (Test-Path $candidate) {
+                $AppPath = $candidate
+                break
+            }
         }
-        if ($AppExe) {
-            $DestDir = Join-Path $env:LOCALAPPDATA "Programs\SecureModelRoute"
+    }
+
+    if (-not $Installed) {
+        $Bundled = Get-ChildItem $SearchRoot -Filter "SecureModelRoute.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($Bundled) {
             New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
-            Copy-Item $AppExe.FullName (Join-Path $DestDir "SecureModelRoute.exe") -Force
-            $StartMenu = [Environment]::GetFolderPath("Programs")
-            $Shortcut = Join-Path $StartMenu "SecureModelRoute.lnk"
-            $Wsh = New-Object -ComObject WScript.Shell
-            $Link = $Wsh.CreateShortcut($Shortcut)
-            $Link.TargetPath = Join-Path $DestDir "SecureModelRoute.exe"
-            $Link.WorkingDirectory = $DestDir
+            Copy-Item $Bundled.FullName $AppPath -Force
+            $Installed = $true
+            Write-InstallLog "    Installed portable app: $AppPath"
+        }
+    }
+
+    if (-not $Installed) {
+        Write-InstallLog "    No bundled desktop app; building from source (requires npm + gui/)"
+        $RepoRoot = if (Test-Path (Join-Path $SearchRoot "Cargo.toml")) { $SearchRoot } else { Split-Path -Parent $SearchRoot }
+        $GuiDir = Join-Path $RepoRoot "gui"
+        if ((Get-Command npm -ErrorAction SilentlyContinue) -and (Test-Path $GuiDir)) {
+            Push-Location $GuiDir
+            $env:CARGO_TARGET_DIR = Join-Path $RepoRoot "target"
+            npm ci --silent 2>$null; if ($LASTEXITCODE -ne 0) { npm install --silent }
+            npm run build --silent
+            Pop-Location
+            $Built = Get-ChildItem (Join-Path $RepoRoot "target\release") -Filter "SecureModelRoute.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($Built) {
+                New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
+                Copy-Item $Built.FullName $AppPath -Force
+                $Installed = $true
+            } else {
+                Write-Warning "Tauri build finished but SecureModelRoute.exe not found under target\release"
+            }
+        } else {
+            Write-Warning "npm or gui/ missing; extract smr-*-windows-x86_64-app.zip or run package.ps1 first"
+        }
+    }
+
+    if ($Installed -and (Test-Path $AppPath)) {
+        $Wsh = New-Object -ComObject WScript.Shell
+        foreach ($shortcut in @(
+            @{ Dir = [Environment]::GetFolderPath("Programs"); Label = "Start menu" },
+            @{ Dir = [Environment]::GetFolderPath("Desktop"); Label = "Desktop" }
+        )) {
+            $LinkPath = Join-Path $shortcut.Dir "SecureModelRoute.lnk"
+            $Link = $Wsh.CreateShortcut($LinkPath)
+            $Link.TargetPath = $AppPath
+            $Link.WorkingDirectory = Split-Path -Parent $AppPath
             $Link.Description = "SecureModelRoute desktop"
             $Link.Save()
-            Write-Host "    Desktop app: $DestDir\SecureModelRoute.exe"
-            Write-Host "    Start menu:  $Shortcut"
-        } else {
-            Write-Warning "Tauri build finished but SecureModelRoute.exe not found under target\release"
+            Write-InstallLog "    $($shortcut.Label): $LinkPath"
         }
-    } else {
-        Write-Warning "npm or gui/ missing; skipped desktop app build"
+        Write-InstallLog "    App: $AppPath"
     }
 }
 
-if ($Service) {
+if ($Gui -or $All) {
+    Write-InstallLog "==> Installing desktop app (Tauri)"
+    Install-SmrDesktop -SearchRoot $Root
+}
+
+if ($Service -or $All) {
     $TaskName = "SecureModelRoute"
     $ServiceCmd = Join-Path $BinDir "smr-service.cmd"
     @(
@@ -96,26 +150,37 @@ if ($Service) {
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Force | Out-Null
-    Write-Host "    Scheduled task: $TaskName (logon, auto-restart)"
-    Write-Host "    Logs: $LogOut"
+    Write-InstallLog "    Scheduled task: $TaskName (logon, auto-restart)"
+    Write-InstallLog "    Logs: $LogOut"
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        Write-InstallLog "    Service started"
+    } catch {
+        Start-Process -FilePath $SmrExe -ArgumentList "--config", $Config -WindowStyle Hidden
+        Write-InstallLog "    Started smr process (task start pending next logon)"
+    }
 }
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notlike "*$BinDir*") {
     [Environment]::SetEnvironmentVariable("Path", "$userPath;$BinDir", "User")
     $env:Path = "$env:Path;$BinDir"
-    Write-Host "    Added $BinDir to user PATH (restart terminal to apply everywhere)"
+    Write-InstallLog "    Added $BinDir to user PATH (restart terminal to apply everywhere)"
 }
 
-Write-Host ""
-Write-Host "Installed:"
-Write-Host "  binary:   $SmrExe"
-Write-Host "  launcher: $Launcher"
-Write-Host "  config:   $Config"
-Write-Host "  GUI:      http://127.0.0.1:8080/ui"
-Write-Host ""
-Write-Host "Run:  securemodelroute"
-Write-Host "Or:   smr.exe --config `"$Config`" --open"
-Write-Host ""
-Write-Host "Background service: .\install.ps1 -Service"
-Write-Host "Desktop app:        .\install.ps1 -Gui"
+Write-InstallLog ""
+Write-InstallLog "Installed:"
+Write-InstallLog "  binary:   $SmrExe"
+Write-InstallLog "  launcher: $Launcher"
+Write-InstallLog "  config:   $Config"
+Write-InstallLog "  web UI:   http://127.0.0.1:8080/ui"
+if ($All) {
+    Write-InstallLog "  mode:     full (CLI + service + desktop GUI)"
+} else {
+    Write-InstallLog ""
+    Write-InstallLog "Optional: .\install.ps1 -All   # CLI + service + GUI"
+    Write-InstallLog "          .\install.ps1 -Service"
+    Write-InstallLog "          .\install.ps1 -Gui"
+}
+Write-InstallLog ""
+Write-InstallLog "Run:  securemodelroute"

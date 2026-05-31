@@ -12,11 +12,11 @@ cargo build --release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if (Test-Path (Join-Path $Root "gui\package.json")) {
-    Write-Host "==> Building desktop app (Tauri)"
+    Write-Host "==> Building desktop app (Tauri, NSIS bundle)"
     if (Get-Command npm -ErrorAction SilentlyContinue) {
         Push-Location (Join-Path $Root "gui")
         npm ci --silent 2>$null; if ($LASTEXITCODE -ne 0) { npm install --silent }
-        npm run build --silent
+        npm run tauri -- build --bundles nsis --silent
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "Tauri build failed; CLI package will still be produced."
         }
@@ -53,6 +53,18 @@ if ($GuiSetup) {
     Copy-Item $GuiSetup.FullName (Join-Path $Out $GuiName) -Force
     $ZipItems += (Join-Path $Out $GuiName)
     Write-Host "==> Desktop installer: $GuiName"
+}
+
+$AppExe = Get-ChildItem (Join-Path $Root "target\release") -Filter "SecureModelRoute.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($AppExe) {
+    $PortableName = "SecureModelRoute.exe"
+    Copy-Item $AppExe.FullName (Join-Path $Out $PortableName) -Force
+    $AppZip = Join-Path $Out "smr-$Version-windows-x86_64-app.zip"
+    if (Test-Path $AppZip) { Remove-Item $AppZip -Force }
+    $AppZipItems = @((Join-Path $Out $PortableName))
+    if ($GuiSetup) { $AppZipItems += (Join-Path $Out $GuiName) }
+    Compress-Archive -Path $AppZipItems -DestinationPath $AppZip -Force
+    Write-Host "==> Desktop app package: $AppZip"
 }
 
 $Zip = Join-Path $Out "$Pkg.zip"

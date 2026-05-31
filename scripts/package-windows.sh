@@ -71,3 +71,15 @@ rm -f "${ZIP}"
 echo "==> Package: ${ZIP}"
 echo "==> Binary:  ${OUT}/smr.exe"
 ls -lh "${ZIP}" "${OUT}/smr.exe"
+
+# Optional Tauri desktop (built on UTM Windows guest; cannot cross-compile WebView2 from macOS)
+UTMCTL="${UTMCTL:-/Applications/UTM.app/Contents/MacOS/utmctl}"
+if [[ "${SMR_BUILD_WINDOWS_GUI:-0}" == "1" ]]; then
+  if [[ -x "${UTMCTL}" ]]; then
+    echo ""
+    bash "${ROOT}/scripts/vm/package-windows-gui.sh" || echo "Warning: Windows desktop app build failed (see dist/windows-desktop-build.log)"
+  else
+    echo "Warning: SMR_BUILD_WINDOWS_GUI=1 but UTM not found; skip smr-*-windows-x86_64-app.zip"
+    echo "  On Windows host: .\\scripts\\package.ps1"
+  fi
+fi
