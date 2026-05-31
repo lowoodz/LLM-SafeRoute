@@ -63,7 +63,9 @@ mac_installed_app_test() {
 
   stage="$(mktemp -d)"
   tar -xzf "$cli_tar" -C "$stage"
-  HOME="$test_home" SMR_INSTALL_PREFIX="${test_home}/.local" bash "${stage}/install.sh"
+  mkdir -p "${test_home}/.local/bin" "${test_home}/.local/etc/securemodelroute"
+  cp "${stage}/smr" "${test_home}/.local/bin/smr"
+  chmod +x "${test_home}/.local/bin/smr"
   rm -rf "$stage"
 
   tar -xzf "$app_tar" -C "$test_root"

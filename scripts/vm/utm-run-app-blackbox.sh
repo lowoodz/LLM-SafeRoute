@@ -51,8 +51,10 @@ while (( SECONDS < DEADLINE )); do
     cat "$LOG_LOCAL" >&2
     exit 1
   fi
-  if grep -q "^ERROR:" "$LOG_LOCAL" 2>/dev/null && grep -q "blackbox_test.py" "$LOG_LOCAL" 2>/dev/null; then
-    :
+  if grep -q "^ERROR:" "$LOG_LOCAL" 2>/dev/null; then
+    echo ""
+    cat "$LOG_LOCAL" >&2
+    exit 1
   fi
   echo "... installed-app test running (${SECONDS}s)"
 done
