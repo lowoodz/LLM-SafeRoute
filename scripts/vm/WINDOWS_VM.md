@@ -79,6 +79,16 @@ sudo chown -R "$(whoami)" /usr/local/Cellar /usr/local/Homebrew /usr/local/bin /
 
 ## 相关脚本
 
-- `scripts/vm/setup-windows-vm.sh` — 主机侧安装 UTM / ISO / 建 VM
-- `scripts/vm/windows-post-install.ps1` — VM 内 OpenSSH + Rust
-- `scripts/windows_vm_test.sh` — 从 Mac SSH 部署 zip 并 `install.ps1` / `verify.ps1`
+| 脚本 | 说明 |
+|------|------|
+| `scripts/vm/setup-windows-vm.sh` | 主机侧安装 UTM / ISO / 建 VM |
+| `scripts/vm/windows-post-install.ps1` | VM 内 OpenSSH + Rust（SSH 测试用） |
+| `scripts/package-windows.sh` | macOS 交叉编译 `dist/smr-*-windows-x86_64.zip` |
+| `scripts/vm/package-windows-gui.sh` | UTM 来宾内构建 `SecureModelRoute.exe` |
+| `scripts/vm/package-windows-setup.sh` | UTM 来宾内 IExpress 产出 `Setup.exe` |
+| `scripts/vm/utm-run-test.sh` | 上传 zip，来宾安装 + 功能测试（11 项） |
+| `scripts/vm/utm-run-all-tests.sh` | 功能 + 黑盒 + 压测（无需 SSH） |
+| `scripts/vm/utm-run-app-blackbox.sh` | 托盘 GUI 安装后黑盒（25 项） |
+| `scripts/windows_vm_test.sh` | 从 Mac **SSH** 部署 zip 并 `install.ps1` / `verify.ps1` |
+
+来宾代理测试默认通过 **utmctl file push/exec** 完成，不依赖 SSH；`windows_vm_test.sh` 为可选的 SSH 路径。
