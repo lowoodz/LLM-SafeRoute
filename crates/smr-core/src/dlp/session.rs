@@ -4,12 +4,10 @@ use dashmap::DashMap;
 
 use crate::config::FileRule;
 use crate::dlp::file::FileDlp;
-use crate::dlp::file::FileContent;
 
 #[derive(Clone)]
 pub struct ActiveFileContent {
     pub rule: FileRule,
-    pub contents: Vec<FileContent>,
 }
 
 struct SessionState {
@@ -45,7 +43,7 @@ impl SessionGuard {
         }
     }
 
-    pub fn activate(&self, session_id: &str, rule: &FileRule, contents: &[FileContent], window: u32) {
+    pub fn activate(&self, session_id: &str, rule: &FileRule, window: u32) {
         let entry = self.sessions.entry(session_id.to_string()).or_insert_with(|| {
             Mutex::new(SessionState {
                 active: Vec::new(),
@@ -61,7 +59,6 @@ impl SessionGuard {
         if !already {
             state.active.push(ActiveFileContent {
                 rule: rule.clone(),
-                contents: contents.to_vec(),
             });
         }
         state.remaining_calls = state.remaining_calls.max(window);

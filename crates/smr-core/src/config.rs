@@ -174,6 +174,73 @@ pub enum ContentCategory {
     Secret,
 }
 
+/// Tunables for disk-backed file index (large corpora, e.g. 10GB+).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileIndexOptions {
+    #[serde(default = "default_index_chunk_size")]
+    pub chunk_size: usize,
+    #[serde(default = "default_index_chunk_overlap")]
+    pub chunk_overlap: usize,
+    #[serde(default = "default_signature_stride")]
+    pub signature_stride: usize,
+    #[serde(default = "default_signatures_per_chunk")]
+    pub signatures_per_chunk: usize,
+    #[serde(default = "default_max_full_file_bytes")]
+    pub max_full_file_bytes: u64,
+    #[serde(default = "default_max_haystack_bytes")]
+    pub max_haystack_bytes: usize,
+    #[serde(default = "default_bloom_megabytes")]
+    pub bloom_megabytes: usize,
+    #[serde(default = "default_build_workers")]
+    pub build_workers: usize,
+    #[serde(default = "default_scan_stride")]
+    pub scan_stride: usize,
+}
+
+impl Default for FileIndexOptions {
+    fn default() -> Self {
+        Self {
+            chunk_size: default_index_chunk_size(),
+            chunk_overlap: default_index_chunk_overlap(),
+            signature_stride: default_signature_stride(),
+            signatures_per_chunk: default_signatures_per_chunk(),
+            max_full_file_bytes: default_max_full_file_bytes(),
+            max_haystack_bytes: default_max_haystack_bytes(),
+            bloom_megabytes: default_bloom_megabytes(),
+            build_workers: default_build_workers(),
+            scan_stride: default_scan_stride(),
+        }
+    }
+}
+
+fn default_index_chunk_size() -> usize {
+    8192
+}
+fn default_index_chunk_overlap() -> usize {
+    64
+}
+fn default_signature_stride() -> usize {
+    128
+}
+fn default_signatures_per_chunk() -> usize {
+    16
+}
+fn default_max_full_file_bytes() -> u64 {
+    512 * 1024
+}
+fn default_max_haystack_bytes() -> usize {
+    2 * 1024 * 1024
+}
+fn default_bloom_megabytes() -> usize {
+    64
+}
+fn default_build_workers() -> usize {
+    8
+}
+fn default_scan_stride() -> usize {
+    16
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileRule {
     pub id: String,
@@ -192,6 +259,8 @@ pub struct FileRule {
     pub min_fragment_ratio: Option<f64>,
     #[serde(default = "default_formats")]
     pub formats: Vec<String>,
+    #[serde(default)]
+    pub index: FileIndexOptions,
 }
 
 fn default_true() -> bool {

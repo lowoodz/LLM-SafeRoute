@@ -53,3 +53,4 @@ grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 rusqlite = { version = "0.32", features = ["bundled"] }
 notify = "7"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }

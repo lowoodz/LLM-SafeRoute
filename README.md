@@ -7,7 +7,7 @@
 | 模块 | 说明 |
 |------|------|
 | **大模型路由** | 多组 fallback（如 high/medium/low），组内按顺序自动切换；上游错误、malformed JSON、流式未出首 token 时触发 fallback；OpenAI ↔ Anthropic 请求/响应双向协议转换 |
-| **DLP（请求侧）** | **内容保护区**：全文/片段匹配（`min_fragment_len` + `min_fragment_ratio`），Secret 类随机替换并尽量保持英文大小写；**文件保护区**：后台 Aho-Corasick 索引（默认含 txt/md/json/yaml/代码/docx/pdf/pptx 等），8KB 分块；`notify` 监听文件变更并重建索引 |
+| **DLP（请求侧）** | **内容保护区**：全文/片段匹配（`min_fragment_len` + `min_fragment_ratio`），Secret 类随机替换并尽量保持英文大小写；**文件保护区**：磁盘索引（SQLite 签名 + Bloom 预过滤 + mmap 校验），流式分块建索引，SessionGuard 仅保存规则元数据；`notify` 监听变更并重建 |
 | **SessionGuard** | 仅在 **tool_call / tool_result** 文本中检测受保护路径；响应侧 tool_call 也可触发；触发后按 `trigger_window` 对后续 N 次请求持续脱敏 |
 | **操作安全** | 请求侧与响应侧 **tool 相关字段** 均检查；`observe`（仅记录）/ `enforce`（拦截）；规则按 command_exec / api_call / network_access + 关键字 |
 | **路径防护** | 独立规则：`deny_delete` / `deny_modify` / `deny_access`；目录自动覆盖子路径；与操作安全共用拦截逻辑 |
@@ -32,6 +32,54 @@
 2. 流式（SSE）：边转发边扫描；操作安全/DLP 在 chunk 管道中处理；首 token 前允许组内 fallback。
 
 全局总开关：`pipeline.security_enabled`（Web 界面右上角「安全防护总开关」）。关闭后 DLP 与操作安全均不生效。
+
+## 大语料文件 DLP（磁盘索引）
+
+面向 **16GB 内存 / 8 核笔记本、约 10GB 文本语料** 的可扩展方案（替代原「全量读入 RAM + Aho-Corasick」）：
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| **P0** | 磁盘索引：流式分块 → xxHash 签名 → SQLite；Bloom 预过滤；命中后 mmap/读文件校验；SessionGuard 仅存 `FileRule` | **已实现** |
+| **P1** | 增量索引：按文件 mtime/size 跳过未变文件；manifest 世代切换 | 规划中 |
+| **P2** | 扫描优化：haystack 分块 + 并行 Bloom；可选 ripgrep 辅助 | 规划中 |
+| **P3** | 超大 haystack（>2MB 单字段）流式扫描与配额 | 规划中 |
+
+**索引目录：** `~/.config/securemodelroute/file-index/{rule_id}/`
+
+| 文件 | 说明 |
+|------|------|
+| `index.db` | 签名表 `(sig_hash, path, byte_offset, byte_len)` |
+| `bloom.bin` | 签名 Bloom 过滤器（建索引后加载到内存） |
+| `manifest.json` | 世代、签名数、文件数 |
+
+**运行时流程：**
+
+1. 后台线程为每条启用的 `file_rules` 建索引；`/api/status` 的 `file_index_ready` 为 true 后生效。
+2. tool_call / tool_result 文本命中受保护路径 → SessionGuard 激活（**不**再克隆整库文本）。
+3. 后续 N 次请求（`trigger_window`）对 JSON 提取字段做 haystack 扫描：Bloom → SQLite 查候选 → 读源文件字节校验 → 脱敏。
+
+**YAML 可调参数（`file_rules[].index`）：**
+
+```yaml
+file_rules:
+  - id: corp-docs
+    path: /data/docs
+    enabled: true
+    recursive: true
+    trigger_window: 5
+    match_mode: fragment
+    min_fragment_len: 32
+    formats: [txt, md, json, yaml, rs, py]
+    index:
+      chunk_size: 8192          # 建索引分块大小
+      chunk_overlap: 64
+      signature_stride: 128     # 块内采样步长
+      signatures_per_chunk: 16
+      max_full_file_bytes: 524288   # 小于此且 full 模式则整文件索引
+      max_haystack_bytes: 2097152   # 单字段最大扫描长度
+      bloom_megabytes: 64
+      build_workers: 8
+```
 
 ## Web 管理界面
 
@@ -186,6 +234,7 @@ brew install mingw-w64
 | `~/.config/securemodelroute/smr.yaml` | 配置（直接运行 `smr` / GUI 默认） |
 | `%APPDATA%\securemodelroute/smr.yaml` | Windows 直接运行时的默认配置 |
 | `~/.config/securemodelroute/data/smr.db` | 请求审计 SQLite |
+| `~/.config/securemodelroute/file-index/` | 文件 DLP 磁盘索引（按 rule_id 子目录） |
 | `http://127.0.0.1:8080/health` | 健康检查 |
 | `http://127.0.0.1:8080/ui` | Web 管理界面 |
 | `http://127.0.0.1:8080/v1` | OpenAI 兼容代理 |

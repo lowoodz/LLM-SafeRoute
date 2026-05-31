@@ -1,7 +1,8 @@
+mod bloom;
 mod content;
+mod disk_index;
 mod doc_extract;
 mod file;
-mod file_index;
 mod fragment;
 mod rg;
 mod sanitize;
@@ -115,8 +116,8 @@ impl DlpEngine {
             return;
         }
         self.file
-            .check_path_triggers_in_tool_text(session_id, &tool_blob, |sid, rule, contents| {
-                self.sessions.activate(sid, rule, contents, rule.trigger_window);
+            .check_path_triggers_in_tool_text(session_id, &tool_blob, |sid, rule| {
+                self.sessions.activate(sid, rule, rule.trigger_window);
             });
     }
 
