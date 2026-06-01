@@ -1,16 +1,19 @@
-//! Disk-backed file index: SQLite signatures + Bloom pre-filter (P0 large corpus).
+//! Disk-backed file index: SQLite signatures + Bloom pre-filter (P0–P1 large corpus).
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 use xxhash_rust::xxh64::xxh64;
 
@@ -24,6 +27,41 @@ use crate::dlp::session::ActiveFileContent;
 use crate::paths;
 
 pub const INDEX_READ_CAP: u64 = 16 * 1024 * 1024;
+
+const GEN_DIR: &str = "gen";
+const CURRENT_FILE: &str = "current.json";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileFingerprint {
+    path: String,
+    mtime_secs: u64,
+    size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FilesManifest {
+    files: Vec<FileFingerprint>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CurrentPointer {
+    generation: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RuleManifest {
+    generation: u64,
+    signatures: u64,
+    files: usize,
+    skipped: usize,
+    reindexed: usize,
+}
+
+struct PreviousGeneration {
+    generation: u64,
+    db_path: PathBuf,
+    files: HashMap<String, FileFingerprint>,
+}
 
 #[derive(Clone)]
 pub struct IndexedRule {
@@ -46,6 +84,16 @@ struct IndexState {
 pub struct FileIndexManager {
     inner: Arc<RwLock<IndexState>>,
     index_root: PathBuf,
+    alive: Arc<AtomicBool>,
+}
+
+static INDEX_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn index_build_lock() -> std::sync::MutexGuard<'static, ()> {
+    INDEX_BUILD_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 struct SigRow {
@@ -55,9 +103,16 @@ struct SigRow {
     byte_len: u32,
 }
 
+impl Drop for FileIndexManager {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
 impl FileIndexManager {
     pub fn new(rules: &[FileRule]) -> Self {
         let index_root = paths::config_dir().join("file-index");
+        let alive = Arc::new(AtomicBool::new(true));
         let inner = Arc::new(RwLock::new(IndexState {
             ready: AtomicBool::new(false),
             rules: Vec::new(),
@@ -66,10 +121,17 @@ impl FileIndexManager {
         let mgr = Self {
             inner: inner.clone(),
             index_root: index_root.clone(),
+            alive: alive.clone(),
         };
         let rules_vec = rules.to_vec();
         thread::spawn(move || {
+            if !alive.load(Ordering::Acquire) {
+                return;
+            }
             if let Ok(state) = build_all_rules(&index_root, &rules_vec) {
+                if !alive.load(Ordering::Acquire) {
+                    return;
+                }
                 let mut guard = inner.write();
                 guard.ready.store(true, Ordering::Release);
                 guard.rules = state.rules;
@@ -127,6 +189,7 @@ impl FileIndexManager {
         let inner = self.inner.clone();
         let index_root = self.index_root.clone();
         let rules_owned = rules.to_vec();
+        let alive = self.alive.clone();
         thread::spawn(move || {
             use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
             let (tx, rx) = mpsc::channel();
@@ -154,8 +217,17 @@ impl FileIndexManager {
                 let _ = watcher.watch(p, mode);
             }
             while rx.recv().is_ok() {
+                if !alive.load(Ordering::Acquire) {
+                    break;
+                }
                 thread::sleep(std::time::Duration::from_millis(2000));
+                if !alive.load(Ordering::Acquire) {
+                    break;
+                }
                 if let Ok(state) = build_all_rules(&index_root, &rules_owned) {
+                    if !alive.load(Ordering::Acquire) {
+                        break;
+                    }
                     let mut guard = inner.write();
                     guard.ready.store(true, Ordering::Release);
                     guard.rules = state.rules;
@@ -172,6 +244,7 @@ struct BuiltState {
 }
 
 fn build_all_rules(index_root: &Path, rules: &[FileRule]) -> Result<BuiltState> {
+    let _lock = index_build_lock();
     fs::create_dir_all(index_root)?;
     let mut indexed_rules = Vec::new();
     let mut snapshots = std::collections::HashMap::new();
@@ -191,20 +264,20 @@ fn build_all_rules(index_root: &Path, rules: &[FileRule]) -> Result<BuiltState> 
 }
 
 fn build_rule_index(index_root: &Path, rule: &FileRule) -> Result<RuleSnapshot> {
-    let rule_dir = index_root.join(sanitize_id(&rule.id));
-    if rule_dir.exists() {
-        fs::remove_dir_all(&rule_dir).ok();
-    }
-    fs::create_dir_all(&rule_dir)?;
-    let db_path = rule_dir.join("index.db");
-    let bloom_path = rule_dir.join("bloom.bin");
-    let generation = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1);
+    let rule_base = index_root.join(sanitize_id(&rule.id));
+    migrate_legacy_layout(&rule_base)?;
 
+    let prev = load_previous_generation(&rule_base)?;
+    let generation = alloc_generation(&rule_base, prev.as_ref().map(|p| p.generation))?;
+
+    let work_dir = rule_base.join(GEN_DIR).join(generation.to_string());
+    fs::create_dir_all(&work_dir)?;
+
+    let db_path = work_dir.join("index.db");
+    let bloom_path = work_dir.join("bloom.bin");
     let bit_count = rule.index.bloom_megabytes * 1024 * 1024 * 8;
     let mut bloom = BloomFilter::new(bit_count.max(1 << 16));
+
     let conn = Connection::open(&db_path)?;
     conn.execute_batch(
         "CREATE TABLE signatures (
@@ -217,12 +290,203 @@ fn build_rule_index(index_root: &Path, rule: &FileRule) -> Result<RuleSnapshot> 
     )?;
     drop(conn);
 
-    let files = collect_files(rule)?;
-    let file_count = files.len();
+    let file_paths = collect_files(rule)?;
+    let file_count = file_paths.len();
+    let (unchanged, to_index, new_manifest) =
+        classify_file_changes(&file_paths, prev.as_ref().map(|p| &p.files))?;
+    let skipped = unchanged.len();
+    let reindexed = to_index.len();
+
+    if let Some(prev_gen) = &prev {
+        let unchanged_paths: Vec<String> = unchanged
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        let copied = copy_signatures_from_db(&db_path, &prev_gen.db_path, &unchanged_paths)?;
+        tracing::debug!(
+            rule_id = %rule.id,
+            copied,
+            skipped,
+            "copied signatures from previous generation"
+        );
+    }
+
+    let _sig_added = index_file_batch(&db_path, &to_index, rule)?;
+    let sig_count = count_signatures(&db_path)?;
+
+    {
+        let conn = Connection::open(&db_path)?;
+        let mut stmt = conn.prepare("SELECT sig_hash FROM signatures")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let h: i64 = row.get(0)?;
+            bloom.insert_hash(h as u64);
+        }
+    }
+    bloom.save(&bloom_path)?;
+
+    let files_manifest = FilesManifest {
+        files: new_manifest.into_values().collect(),
+    };
+    fs::write(
+        work_dir.join("files.json"),
+        serde_json::to_string(&files_manifest)?,
+    )?;
+
+    let manifest = RuleManifest {
+        generation,
+        signatures: sig_count,
+        files: file_count,
+        skipped,
+        reindexed,
+    };
+    fs::write(
+        work_dir.join("manifest.json"),
+        serde_json::to_string(&manifest)?,
+    )?;
+
+    write_current_pointer(&rule_base, generation)?;
+    cleanup_old_generations(&rule_base, generation)?;
+
+    tracing::info!(
+        rule_id = %rule.id,
+        generation,
+        signatures = sig_count,
+        files = file_count,
+        skipped,
+        reindexed,
+        "file index built (incremental)"
+    );
+
+    Ok(RuleSnapshot {
+        generation,
+        bloom,
+        db_path,
+    })
+}
+
+fn next_generation(prev: Option<u64>) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1);
+    match prev {
+        Some(g) if now <= g => g + 1,
+        _ => now,
+    }
+}
+
+fn alloc_generation(rule_base: &Path, prev: Option<u64>) -> Result<u64> {
+    let mut gen = next_generation(prev);
+    loop {
+        let work_dir = rule_base.join(GEN_DIR).join(gen.to_string());
+        if !work_dir.exists() {
+            return Ok(gen);
+        }
+        gen += 1;
+    }
+}
+
+fn migrate_legacy_layout(rule_base: &Path) -> Result<()> {
+    let legacy_db = rule_base.join("index.db");
+    if legacy_db.exists() && !rule_base.join(CURRENT_FILE).exists() {
+        fs::remove_dir_all(rule_base).context("remove legacy flat index layout")?;
+    }
+    Ok(())
+}
+
+fn load_previous_generation(rule_base: &Path) -> Result<Option<PreviousGeneration>> {
+    let current_path = rule_base.join(CURRENT_FILE);
+    if !current_path.exists() {
+        return Ok(None);
+    }
+    let current: CurrentPointer =
+        serde_json::from_str(&fs::read_to_string(&current_path).context("read current.json")?)?;
+    let work_dir = rule_base.join(GEN_DIR).join(current.generation.to_string());
+    let db_path = work_dir.join("index.db");
+    let files_path = work_dir.join("files.json");
+    if !db_path.exists() || !files_path.exists() {
+        return Ok(None);
+    }
+    let files_manifest: FilesManifest =
+        serde_json::from_str(&fs::read_to_string(&files_path).context("read files.json")?)?;
+    let files = files_manifest
+        .files
+        .into_iter()
+        .map(|f| (f.path.clone(), f))
+        .collect();
+    Ok(Some(PreviousGeneration {
+        generation: current.generation,
+        db_path,
+        files,
+    }))
+}
+
+fn classify_file_changes(
+    paths: &[PathBuf],
+    prev: Option<&HashMap<String, FileFingerprint>>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>, HashMap<String, FileFingerprint>)> {
+    let mut unchanged = Vec::new();
+    let mut to_index = Vec::new();
+    let mut new_manifest = HashMap::new();
+    for path in paths {
+        let fp = fingerprint_file(path)?;
+        new_manifest.insert(fp.path.clone(), fp.clone());
+        let same = prev
+            .and_then(|m| m.get(&fp.path))
+            .is_some_and(|old| old == &fp);
+        if same {
+            unchanged.push(path.clone());
+        } else {
+            to_index.push(path.clone());
+        }
+    }
+    Ok((unchanged, to_index, new_manifest))
+}
+
+fn fingerprint_file(path: &Path) -> Result<FileFingerprint> {
+    let meta = fs::metadata(path)?;
+    let modified = meta
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok(FileFingerprint {
+        path: path.to_string_lossy().replace('\\', "/"),
+        mtime_secs: modified.as_secs(),
+        size: meta.len(),
+    })
+}
+
+fn copy_signatures_from_db(new_db: &Path, old_db: &Path, paths: &[String]) -> Result<u64> {
+    if paths.is_empty() || !old_db.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open(new_db)?;
+    let old_path = old_db.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!("ATTACH DATABASE '{old_path}' AS old_db"))?;
+    let mut copied = 0u64;
+    for path in paths {
+        let n = conn.execute(
+            "INSERT INTO signatures (sig_hash, path, byte_offset, byte_len)
+             SELECT sig_hash, path, byte_offset, byte_len FROM old_db.signatures WHERE path = ?1",
+            params![path],
+        )?;
+        copied += n as u64;
+    }
+    conn.execute_batch("DETACH old_db")?;
+    Ok(copied)
+}
+
+fn index_file_batch(db_path: &Path, files: &[PathBuf], rule: &FileRule) -> Result<u64> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let before = count_signatures(db_path)?;
     let workers = rule.index.build_workers.max(1).min(16);
     let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<SigRow>>(workers * 4);
-    let db_path_writer = db_path.clone();
-    let files_arc = Arc::new(files);
+    let db_path_writer = db_path.to_path_buf();
+    let files_arc = Arc::new(files.to_vec());
 
     let writer = thread::spawn(move || -> Result<u64> {
         let conn = Connection::open(&db_path_writer)?;
@@ -273,38 +537,42 @@ fn build_rule_index(index_root: &Path, rule: &FileRule) -> Result<RuleSnapshot> 
         let _ = h.join();
     }
     let _ = shutdown_tx.send(Vec::new());
-    let sig_count = writer.join().unwrap_or(Ok(0))?;
+    let _ = writer.join().unwrap_or(Ok(0))?;
+    let after = count_signatures(db_path)?;
+    Ok(after.saturating_sub(before))
+}
 
-    // Build bloom from DB (streaming read hashes)
-    {
-        let conn = Connection::open(&db_path)?;
-        let mut stmt = conn.prepare("SELECT sig_hash FROM signatures")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let h: i64 = row.get(0)?;
-            bloom.insert_hash(h as u64);
+fn count_signatures(db_path: &Path) -> Result<u64> {
+    let conn = Connection::open(db_path)?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM signatures", [], |r| r.get(0))?;
+    Ok(n as u64)
+}
+
+fn write_current_pointer(rule_base: &Path, generation: u64) -> Result<()> {
+    fs::create_dir_all(rule_base)?;
+    let tmp = rule_base.join(format!("{CURRENT_FILE}.tmp"));
+    let pointer = CurrentPointer { generation };
+    fs::write(&tmp, serde_json::to_string(&pointer)?)?;
+    fs::rename(tmp, rule_base.join(CURRENT_FILE))?;
+    Ok(())
+}
+
+fn cleanup_old_generations(rule_base: &Path, keep: u64) -> Result<()> {
+    let gen_root = rule_base.join(GEN_DIR);
+    if !gen_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&gen_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str != keep.to_string() {
+            fs::remove_dir_all(entry.path()).ok();
         }
     }
-    bloom.save(&bloom_path)?;
-
-    let manifest = rule_dir.join("manifest.json");
-    let mut mf = File::create(&manifest)?;
-    write!(
-        mf,
-        r#"{{"generation":{generation},"signatures":{sig_count},"files":{file_count}}}"#
-    )?;
-
-    tracing::info!(
-        rule_id = %rule.id,
-        signatures = sig_count,
-        "file index built (disk-backed)"
-    );
-
-    Ok(RuleSnapshot {
-        generation,
-        bloom,
-        db_path,
-    })
+    Ok(())
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -680,12 +948,31 @@ fn replace_char_range(text: &str, start: usize, end: usize, replacement: &str) -
     out
 }
 
-pub fn check_path_in_rules(rules: &[IndexedRule], tool_text: &str) -> Vec<FileRule> {
-    rules
+pub fn filter_most_specific_rules(rules: &[IndexedRule], tool_text: &str) -> Vec<FileRule> {
+    let matches: Vec<&IndexedRule> = rules
         .iter()
         .filter(|r| path_trigger_match(&r.normalized_path, tool_text))
+        .collect();
+    if matches.is_empty() {
+        return Vec::new();
+    }
+    let match_paths: Vec<&str> = matches.iter().map(|m| m.normalized_path.as_str()).collect();
+    matches
+        .into_iter()
+        .filter(|candidate| {
+            let p = candidate.normalized_path.as_str();
+            !match_paths.iter().any(|other| {
+                *other != p
+                    && other.starts_with(p)
+                    && other.as_bytes().get(p.len()) == Some(&b'/')
+            })
+        })
         .map(|r| r.rule.clone())
         .collect()
+}
+
+pub fn check_path_in_rules(rules: &[IndexedRule], tool_text: &str) -> Vec<FileRule> {
+    filter_most_specific_rules(rules, tool_text)
 }
 
 #[cfg(test)]
@@ -725,5 +1012,64 @@ mod tests {
         let out = scan_haystack(hay, &rule, &snapshot);
         assert!(!out.contains("TOP-SECRET-PHRASE-XYZZY"));
         assert_eq!(out.chars().count(), hay.chars().count());
+    }
+
+    #[test]
+    fn incremental_rebuild_skips_unchanged_files() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        fs::write(&a, "ALPHA-SECRET-ONE").unwrap();
+        fs::write(&b, "BETA-SECRET-TWO").unwrap();
+
+        let rule = FileRule {
+            id: "inc".into(),
+            path: tmp.path().to_path_buf(),
+            enabled: true,
+            recursive: true,
+            trigger_window: 3,
+            match_mode: MatchMode::Fragment,
+            min_fragment_len: Some(8),
+            min_fragment_ratio: None,
+            formats: vec!["txt".into()],
+            index: FileIndexOptions {
+                bloom_megabytes: 1,
+                build_workers: 2,
+                ..Default::default()
+            },
+        };
+
+        let index_root = tmp.path().join("idx");
+        let snap1 = build_rule_index(&index_root, &rule).unwrap();
+        let gen1 = snap1.generation;
+
+        let snap2 = build_rule_index(&index_root, &rule).unwrap();
+        assert!(snap2.generation >= gen1);
+        let manifest_path = index_root
+            .join("inc")
+            .join(GEN_DIR)
+            .join(snap2.generation.to_string())
+            .join("manifest.json");
+        let manifest: RuleManifest =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.files, 2);
+        assert_eq!(manifest.skipped, 2);
+        assert_eq!(manifest.reindexed, 0);
+
+        fs::write(&a, "ALPHA-SECRET-ONE-MODIFIED").unwrap();
+        let snap3 = build_rule_index(&index_root, &rule).unwrap();
+        let manifest_path = index_root
+            .join("inc")
+            .join(GEN_DIR)
+            .join(snap3.generation.to_string())
+            .join("manifest.json");
+        let manifest: RuleManifest =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.skipped, 1);
+        assert_eq!(manifest.reindexed, 1);
+
+        let hay = "leak ALPHA-SECRET-ONE-MODIFIED end";
+        let out = scan_haystack(hay, &rule, &snap3);
+        assert!(!out.contains("ALPHA-SECRET-ONE-MODIFIED"));
     }
 }

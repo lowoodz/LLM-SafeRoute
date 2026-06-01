@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::config::FileRule;
-use crate::dlp::disk_index::FileIndexManager;
+use crate::dlp::disk_index::{FileIndexManager, filter_most_specific_rules};
 use crate::dlp::session::ActiveFileContent;
 
 pub struct FileDlp {
@@ -29,10 +29,9 @@ impl FileDlp {
         tool_text: &str,
         activate: impl Fn(&str, &FileRule),
     ) {
-        for indexed in self.index.rules() {
-            if path_trigger_match(&indexed.normalized_path, tool_text) {
-                activate(session_id, &indexed.rule);
-            }
+        let rules = self.index.rules();
+        for rule in filter_most_specific_rules(&rules, tool_text) {
+            activate(session_id, &rule);
         }
     }
 
@@ -62,10 +61,91 @@ fn is_path_token_char(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FileIndexOptions, FileRule, MatchMode};
+    use crate::dlp::disk_index::IndexedRule;
+    use std::path::PathBuf;
 
     #[test]
     fn path_trigger_avoids_prefix_false_positive() {
         assert!(!path_trigger_match("/secret", "/secrets-backup/file.txt"));
         assert!(path_trigger_match("/secret", "read /secret/file"));
+    }
+
+    #[test]
+    fn most_specific_path_wins_over_parent() {
+        let parent = IndexedRule {
+            rule: FileRule {
+                id: "parent".into(),
+                path: PathBuf::from("/data/parent"),
+                enabled: true,
+                recursive: true,
+                trigger_window: 3,
+                match_mode: MatchMode::Fragment,
+                min_fragment_len: None,
+                min_fragment_ratio: None,
+                formats: vec!["txt".into()],
+                index: FileIndexOptions::default(),
+            },
+            normalized_path: "/data/parent".into(),
+        };
+        let child = IndexedRule {
+            rule: FileRule {
+                id: "child".into(),
+                path: PathBuf::from("/data/parent/child"),
+                enabled: true,
+                recursive: true,
+                trigger_window: 3,
+                match_mode: MatchMode::Fragment,
+                min_fragment_len: None,
+                min_fragment_ratio: None,
+                formats: vec!["txt".into()],
+                index: FileIndexOptions::default(),
+            },
+            normalized_path: "/data/parent/child".into(),
+        };
+        let rules = vec![parent, child];
+        let tool = "read_file /data/parent/child/report.txt";
+        let matched = filter_most_specific_rules(&rules, tool);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "child");
+    }
+
+    #[test]
+    fn parent_still_triggers_when_child_not_mentioned() {
+        let parent = IndexedRule {
+            rule: FileRule {
+                id: "parent".into(),
+                path: PathBuf::from("/data/parent"),
+                enabled: true,
+                recursive: true,
+                trigger_window: 3,
+                match_mode: MatchMode::Fragment,
+                min_fragment_len: None,
+                min_fragment_ratio: None,
+                formats: vec!["txt".into()],
+                index: FileIndexOptions::default(),
+            },
+            normalized_path: "/data/parent".into(),
+        };
+        let child = IndexedRule {
+            rule: FileRule {
+                id: "child".into(),
+                path: PathBuf::from("/data/parent/child"),
+                enabled: true,
+                recursive: true,
+                trigger_window: 3,
+                match_mode: MatchMode::Fragment,
+                min_fragment_len: None,
+                min_fragment_ratio: None,
+                formats: vec!["txt".into()],
+                index: FileIndexOptions::default(),
+            },
+            normalized_path: "/data/parent/child".into(),
+        };
+        let rules = vec![parent, child];
+        let tool = "read_file /data/parent/top.txt";
+        let matched = filter_most_specific_rules(&rules, tool);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "parent");
     }
 }

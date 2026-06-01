@@ -40,7 +40,7 @@
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | **P0** | 磁盘索引：流式分块 → xxHash 签名 → SQLite；Bloom 预过滤；命中后 mmap/读文件校验；SessionGuard 仅存 `FileRule` | **已实现** |
-| **P1** | 增量索引：按文件 mtime/size 跳过未变文件；manifest 世代切换 | 规划中 |
+| **P1** | 增量索引：按文件 mtime/size 跳过未变文件；`gen/{generation}/` 世代目录 + `current.json` 原子切换 | **已实现** |
 | **P2** | 扫描优化：haystack 分块 + 并行 Bloom；可选 ripgrep 辅助 | 规划中 |
 | **P3** | 超大 haystack（>2MB 单字段）流式扫描与配额 | 规划中 |
 
@@ -48,14 +48,16 @@
 
 | 文件 | 说明 |
 |------|------|
-| `index.db` | 签名表 `(sig_hash, path, byte_offset, byte_len)` |
-| `bloom.bin` | 签名 Bloom 过滤器（建索引后加载到内存） |
-| `manifest.json` | 世代、签名数、文件数 |
+| `current.json` | 当前生效世代指针 |
+| `gen/{generation}/index.db` | 签名表 `(sig_hash, path, byte_offset, byte_len)` |
+| `gen/{generation}/bloom.bin` | 签名 Bloom 过滤器（建索引后加载到内存） |
+| `gen/{generation}/files.json` | 各文件 mtime/size 指纹（增量比对用） |
+| `gen/{generation}/manifest.json` | 世代、签名数、文件数、skipped/reindexed 统计 |
 
 **运行时流程：**
 
 1. 后台线程为每条启用的 `file_rules` 建索引；`/api/status` 的 `file_index_ready` 为 true 后生效。
-2. tool_call / tool_result 文本命中受保护路径 → SessionGuard 激活（**不**再克隆整库文本）。
+2. tool_call / tool_result 文本命中受保护路径 → SessionGuard 激活（**不**再克隆整库文本；**仅最具体路径**匹配，父路径规则不重复触发）。
 3. 后续 N 次请求（`trigger_window`）对 JSON 提取字段做 haystack 扫描：Bloom → SQLite 查候选 → 读源文件字节校验 → 脱敏。
 
 **YAML 可调参数（`file_rules[].index`）：**
