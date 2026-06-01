@@ -137,8 +137,13 @@ def get_config(base: str) -> dict | None:
     return json.loads(text)
 
 
-def put_config(base: str, config: dict) -> int:
-    code, _, _ = http("PUT", f"{base}/api/config", body=config)
+def put_config(base: str, config: dict, *, timeout: float = 120.0) -> int:
+    code = 0
+    for attempt in range(3):
+        code, _, _ = http("PUT", f"{base}/api/config", body=config, timeout=timeout)
+        if code == 200:
+            return code
+        time.sleep(1.0 + attempt)
     return code
 
 

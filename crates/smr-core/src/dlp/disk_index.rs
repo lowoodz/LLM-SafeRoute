@@ -20,7 +20,7 @@ use xxhash_rust::xxh64::xxh64;
 use crate::config::{FileRule, MatchMode};
 use crate::dlp::bloom::BloomFilter;
 use crate::dlp::doc_extract;
-use crate::dlp::file::path_trigger_match;
+use crate::dlp::file::{path_trigger_match, paths_equivalent, strip_verbatim_path_prefix};
 use crate::dlp::fragment::effective_min_fragment_len;
 use crate::dlp::rg::find_literal_byte_offsets;
 use crate::dlp::sanitize::{sanitize_range, sanitize_whole};
@@ -201,7 +201,9 @@ impl FileIndexManager {
                 continue;
             }
             for indexed in snapshot.indexed_paths.iter() {
-                if indexed == candidate || indexed.ends_with(&format!("/{}", candidate.trim_start_matches('/')))
+                if paths_equivalent(indexed, &norm)
+                    || paths_equivalent(indexed, candidate)
+                    || indexed.ends_with(&format!("/{}", candidate.trim_start_matches('/')))
                 {
                     out.insert(indexed.clone());
                 }
@@ -840,12 +842,16 @@ fn signature_lengths(min_len: usize, chunk_len: usize) -> Vec<usize> {
 }
 
 fn normalize_index_path(path: &Path) -> String {
-    if path.is_file() {
+    let raw = if path.is_file() {
         if let Ok(canon) = fs::canonicalize(path) {
-            return canon.to_string_lossy().replace('\\', "/");
+            canon.to_string_lossy().replace('\\', "/")
+        } else {
+            path.to_string_lossy().replace('\\', "/")
         }
-    }
-    path.to_string_lossy().replace('\\', "/")
+    } else {
+        path.to_string_lossy().replace('\\', "/")
+    };
+    strip_verbatim_path_prefix(&raw)
 }
 
 fn scan_haystack(

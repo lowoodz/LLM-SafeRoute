@@ -127,7 +127,41 @@ fn extract_absolute_path_candidates(tool_text: &str) -> Vec<String> {
 }
 
 fn path_under_rule(path: &str, rule_base: &str) -> bool {
-    path == rule_base || path.starts_with(&format!("{rule_base}/"))
+    let path = normalize_trigger_path(path);
+    let rule_base = normalize_trigger_path(rule_base);
+    #[cfg(windows)]
+    {
+        let path = path.to_ascii_lowercase();
+        let rule_base = rule_base.to_ascii_lowercase();
+        return path == rule_base || path.starts_with(&format!("{rule_base}/"));
+    }
+    #[cfg(not(windows))]
+    {
+        path == rule_base || path.starts_with(&format!("{rule_base}/"))
+    }
+}
+
+/// Strip Win32 verbatim `\\?\` prefix so tool paths and index paths compare equal.
+pub fn strip_verbatim_path_prefix(path: &str) -> String {
+    let p = normalize_path_str(path);
+    p.strip_prefix("//?/").unwrap_or(&p).to_string()
+}
+
+pub fn normalize_trigger_path(path: &str) -> String {
+    strip_verbatim_path_prefix(path)
+}
+
+pub fn paths_equivalent(a: &str, b: &str) -> bool {
+    let a = normalize_trigger_path(a);
+    let b = normalize_trigger_path(b);
+    #[cfg(windows)]
+    {
+        a.eq_ignore_ascii_case(&b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 fn normalize_path_str(path: &str) -> String {
@@ -138,10 +172,10 @@ fn normalize_existing_path(path: &str) -> String {
     let p = PathBuf::from(path);
     if p.is_file() {
         if let Ok(canon) = std::fs::canonicalize(&p) {
-            return canon.to_string_lossy().replace('\\', "/");
+            return normalize_trigger_path(&canon.to_string_lossy());
         }
     }
-    normalize_path_str(path)
+    normalize_trigger_path(path)
 }
 
 fn is_path_char(b: u8) -> bool {
