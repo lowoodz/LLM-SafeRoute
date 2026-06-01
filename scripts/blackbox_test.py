@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import threading
@@ -1271,7 +1272,7 @@ def main() -> int:
         print(f"==> Black-box tests @ {BASE}")
         proc = start_smr(cfg_file)
         time.sleep(1.0)
-        if not wait_ready(BASE):
+        if not wait_ready(BASE, timeout=120.0):
             report.add("系统", "startup", False, "timeout")
             print_report(report)
             return 1
@@ -1287,9 +1288,7 @@ def main() -> int:
             srv.shutdown()
         if cfg_file and cfg_file.exists():
             cfg_file.unlink(missing_ok=True)
-        for p in secrets_dir.glob("*"):
-            p.unlink(missing_ok=True)
-        secrets_dir.rmdir()
+        shutil.rmtree(secrets_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

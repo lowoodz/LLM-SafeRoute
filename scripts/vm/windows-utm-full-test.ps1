@@ -224,7 +224,11 @@ try {
         )
         max_tokens = 8
     } | ConvertTo-Json -Depth 8 -Compress
-    Invoke-RestMethod -Uri "$Base/v1/chat/completions" -Method Post -Body $probeTrigger -ContentType "application/json" -Headers @{ "X-SMR-Session-Id" = "win-install-file-session" } -TimeoutSec 120 | Out-Null
+    Invoke-RestMethod -Uri "$Base/v1/chat/completions" -Method Post -Body $probeTrigger -ContentType "application/json" -Headers @{ "X-SMR-Session-Id" = "win-install-file-session" } -TimeoutSec 120 -ErrorAction SilentlyContinue | Out-Null
+} catch {
+    Log "file_session trigger HTTP note: $($_.Exception.Message)"
+}
+try {
     $fileBody = @{
         model = "deepseek-chat"
         messages = @(@{ role = "user"; content = "file probe secret: $FileProbeSecret" })

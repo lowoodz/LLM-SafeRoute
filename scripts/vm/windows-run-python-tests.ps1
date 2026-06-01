@@ -91,6 +91,9 @@ if (-not $python) {
 
 Log "Using Python: $(& $python --version 2>&1) at $python"
 
+Get-Process smr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
 & $python -m pip install --quiet --disable-pip-version-check openai 2>&1 | ForEach-Object { Log "pip: $_" }
 
 $env:SMR_BIN = $SmrBin
