@@ -41,7 +41,7 @@
 |------|------|------|
 | **P0** | 磁盘索引：流式分块 → xxHash 签名 → SQLite；Bloom 预过滤；命中后 mmap/读文件校验；SessionGuard 仅存 `FileRule` | **已实现** |
 | **P1** | 增量索引：按文件 mtime/size 跳过未变文件；`gen/{generation}/` 世代目录 + `current.json` 原子切换 | **已实现** |
-| **P2** | 扫描优化：haystack 分块 + 并行 Bloom；可选 ripgrep 辅助 | 规划中 |
+| **P2** | 扫描优化：haystack 分块 + 多线程 Bloom；ripgrep 字面量预过滤（≥8KB haystack） | **已实现** |
 | **P3** | 超大 haystack（>2MB 单字段）流式扫描与配额 | 规划中 |
 
 **索引目录：** `~/.config/securemodelroute/file-index/{rule_id}/`
@@ -53,6 +53,7 @@
 | `gen/{generation}/bloom.bin` | 签名 Bloom 过滤器（建索引后加载到内存） |
 | `gen/{generation}/files.json` | 各文件 mtime/size 指纹（增量比对用） |
 | `gen/{generation}/manifest.json` | 世代、签名数、文件数、skipped/reindexed 统计 |
+| `gen/{generation}/literals.json` | rg 预过滤用字面量样本（建索引时从签名抽取） |
 
 **运行时流程：**
 
@@ -81,6 +82,9 @@ file_rules:
       max_haystack_bytes: 2097152   # 单字段最大扫描长度
       bloom_megabytes: 64
       build_workers: 8
+      scan_workers: 4              # haystack 分块并行 Bloom 扫描线程数
+      scan_rg_prefilter: true      # ≥8KB haystack 启用 ripgrep 字面量预过滤
+      scan_rg_literals_max: 2048   # 预过滤字面量样本上限
 ```
 
 ## Web 管理界面

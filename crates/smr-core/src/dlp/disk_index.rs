@@ -1,6 +1,6 @@
-//! Disk-backed file index: SQLite signatures + Bloom pre-filter (P0–P1 large corpus).
+//! Disk-backed file index: SQLite signatures + Bloom pre-filter (P0–P2 large corpus).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ use crate::dlp::bloom::BloomFilter;
 use crate::dlp::doc_extract;
 use crate::dlp::file::path_trigger_match;
 use crate::dlp::fragment::effective_min_fragment_len;
+use crate::dlp::rg::find_literal_byte_offsets;
 use crate::dlp::sanitize::{sanitize_range, sanitize_whole};
 use crate::dlp::session::ActiveFileContent;
 use crate::paths;
@@ -30,6 +31,9 @@ pub const INDEX_READ_CAP: u64 = 16 * 1024 * 1024;
 
 const GEN_DIR: &str = "gen";
 const CURRENT_FILE: &str = "current.json";
+const LITERALS_FILE: &str = "literals.json";
+/// Haystack length at which ripgrep literal prefilter is enabled.
+const RG_PREFILTER_MIN_BYTES: usize = 8192;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileFingerprint {
@@ -73,6 +77,7 @@ struct RuleSnapshot {
     generation: u64,
     bloom: BloomFilter,
     db_path: PathBuf,
+    literals: Arc<Vec<String>>,
 }
 
 struct IndexState {
@@ -345,6 +350,16 @@ fn build_rule_index(index_root: &Path, rule: &FileRule) -> Result<RuleSnapshot> 
         serde_json::to_string(&manifest)?,
     )?;
 
+    let literals = if rule.index.scan_rg_prefilter {
+        build_scan_literals(&db_path, rule, rule.index.scan_rg_literals_max)?
+    } else {
+        Vec::new()
+    };
+    fs::write(
+        work_dir.join(LITERALS_FILE),
+        serde_json::to_string(&literals)?,
+    )?;
+
     write_current_pointer(&rule_base, generation)?;
     cleanup_old_generations(&rule_base, generation)?;
 
@@ -362,6 +377,7 @@ fn build_rule_index(index_root: &Path, rule: &FileRule) -> Result<RuleSnapshot> 
         generation,
         bloom,
         db_path,
+        literals: Arc::new(literals),
     })
 }
 
@@ -812,32 +828,28 @@ fn scan_haystack(haystack: &str, rule: &FileRule, snapshot: &RuleSnapshot) -> St
 
     let lens = signature_lengths(min_len, bytes.len().min(rule.index.chunk_size));
 
-    let conn = match Connection::open_with_flags(
+    let Ok(conn) = Connection::open_with_flags(
         &snapshot.db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
-        Ok(c) => c,
-        Err(_) => return haystack.to_string(),
+    ) else {
+        return haystack.to_string();
     };
 
-    let mut byte_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        for &len in &lens {
-            if pos + len > bytes.len() {
-                continue;
-            }
-            let candidate = &bytes[pos..pos + len];
-            let h = xxh64(candidate, 0);
-            if !snapshot.bloom.may_contain(h) {
-                continue;
-            }
-            if verify_candidate(&conn, h, candidate) {
-                byte_ranges.push((pos, pos + len));
-            }
-        }
-        pos += 1;
+    let mut byte_ranges = Vec::new();
+
+    if rule.index.scan_rg_prefilter
+        && bytes.len() >= RG_PREFILTER_MIN_BYTES
+        && !snapshot.literals.is_empty()
+    {
+        byte_ranges.extend(rg_prefilter_ranges(
+            bytes,
+            snapshot.literals.as_ref(),
+            &snapshot.bloom,
+            &conn,
+        ));
     }
+
+    byte_ranges.extend(parallel_bloom_scan(bytes, rule, snapshot, &lens));
 
     if byte_ranges.is_empty() {
         return haystack.to_string();
@@ -846,6 +858,185 @@ fn scan_haystack(haystack: &str, rule: &FileRule, snapshot: &RuleSnapshot) -> St
     byte_ranges.sort_by_key(|r| r.0);
     let merged = merge_byte_ranges(byte_ranges);
     apply_byte_ranges(haystack, &merged, rule.match_mode)
+}
+
+fn rg_prefilter_ranges(
+    bytes: &[u8],
+    literals: &[String],
+    bloom: &BloomFilter,
+    conn: &Connection,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for lit in literals {
+        if lit.is_empty() {
+            continue;
+        }
+        let lit_bytes = lit.as_bytes();
+        for pos in find_literal_byte_offsets(bytes, lit_bytes) {
+            let end = pos + lit_bytes.len();
+            if end > bytes.len() {
+                continue;
+            }
+            let candidate = &bytes[pos..end];
+            let h = xxh64(candidate, 0);
+            if bloom.may_contain(h) && verify_candidate(conn, h, candidate) {
+                ranges.push((pos, end));
+            }
+        }
+    }
+    ranges
+}
+
+fn parallel_bloom_scan(
+    bytes: &[u8],
+    rule: &FileRule,
+    snapshot: &RuleSnapshot,
+    lens: &[usize],
+) -> Vec<(usize, usize)> {
+    let chunk_size = rule.index.chunk_size;
+    let overlap = rule.index.chunk_overlap;
+    let step = chunk_size.saturating_sub(overlap).max(1);
+    let workers = rule.index.scan_workers.max(1).min(16);
+    let starts: Vec<usize> = (0..bytes.len()).step_by(step).collect();
+
+    if bytes.len() <= chunk_size || workers == 1 || starts.len() <= 1 {
+        return scan_region_bloom(bytes, 0, lens, &snapshot.bloom, &snapshot.db_path);
+    }
+
+    let bytes = Arc::new(bytes.to_vec());
+    let db_path = snapshot.db_path.clone();
+    let bloom = snapshot.bloom.clone();
+    let lens = Arc::new(lens.to_vec());
+    let (tx, rx) = mpsc::channel::<Vec<(usize, usize)>>();
+
+    for worker_id in 0..workers {
+        let tx = tx.clone();
+        let bytes = bytes.clone();
+        let db_path = db_path.clone();
+        let bloom = bloom.clone();
+        let lens = lens.clone();
+        let starts = starts.clone();
+        thread::spawn(move || {
+            let Ok(conn) = Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) else {
+                let _ = tx.send(Vec::new());
+                return;
+            };
+            let mut local = Vec::new();
+            let mut idx = worker_id;
+            while idx < starts.len() {
+                let start = starts[idx];
+                let end = (start + chunk_size).min(bytes.len());
+                local.extend(scan_region_bloom_slice(
+                    &bytes[start..end],
+                    start,
+                    &lens,
+                    &bloom,
+                    &conn,
+                ));
+                idx += workers;
+            }
+            let _ = tx.send(local);
+        });
+    }
+    drop(tx);
+
+    let mut all = Vec::new();
+    while let Ok(mut batch) = rx.recv() {
+        all.append(&mut batch);
+    }
+    all
+}
+
+fn scan_region_bloom(
+    bytes: &[u8],
+    base_offset: usize,
+    lens: &[usize],
+    bloom: &BloomFilter,
+    db_path: &Path,
+) -> Vec<(usize, usize)> {
+    let Ok(conn) = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Vec::new();
+    };
+    scan_region_bloom_slice(bytes, base_offset, lens, bloom, &conn)
+}
+
+fn scan_region_bloom_slice(
+    bytes: &[u8],
+    base_offset: usize,
+    lens: &[usize],
+    bloom: &BloomFilter,
+    conn: &Connection,
+) -> Vec<(usize, usize)> {
+    let mut byte_ranges = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        for &len in lens {
+            if pos + len > bytes.len() {
+                continue;
+            }
+            let candidate = &bytes[pos..pos + len];
+            let h = xxh64(candidate, 0);
+            if !bloom.may_contain(h) {
+                continue;
+            }
+            if verify_candidate(conn, h, candidate) {
+                byte_ranges.push((base_offset + pos, base_offset + pos + len));
+            }
+        }
+        pos += 1;
+    }
+    byte_ranges
+}
+
+fn build_scan_literals(db_path: &Path, rule: &FileRule, cap: usize) -> Result<Vec<String>> {
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+    let min_len = effective_min_fragment_len(
+        rule.index.chunk_size,
+        rule.min_fragment_len,
+        rule.min_fragment_ratio,
+    )
+    .max(4);
+    let max_len = 512usize;
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "SELECT path, byte_offset, byte_len FROM signatures
+         WHERE byte_len >= ?1 AND byte_len <= ?2
+         ORDER BY sig_hash
+         LIMIT ?3",
+    )?;
+    let fetch = cap.saturating_mul(4).min(100_000);
+    let mut rows = stmt.query(params![min_len as i64, max_len as i64, fetch as i64])?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let offset: i64 = row.get(1)?;
+        let len: i32 = row.get(2)?;
+        let Some(lit) = read_literal_string(&path, offset as u64, len as u32) else {
+            continue;
+        };
+        if lit.len() >= min_len && seen.insert(lit.clone()) {
+            out.push(lit);
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn read_literal_string(path: &str, offset: u64, len: u32) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    f.seek(std::io::SeekFrom::Start(offset)).ok()?;
+    f.read_exact(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn verify_candidate(conn: &Connection, hash: u64, candidate: &[u8]) -> bool {
@@ -1071,5 +1262,42 @@ mod tests {
         let hay = "leak ALPHA-SECRET-ONE-MODIFIED end";
         let out = scan_haystack(hay, &rule, &snap3);
         assert!(!out.contains("ALPHA-SECRET-ONE-MODIFIED"));
+    }
+
+    #[test]
+    fn parallel_scan_finds_secret_in_large_haystack() {
+        let tmp = TempDir::new().unwrap();
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&secret, "WIDE-CORPUS-LEAK-TOKEN-99").unwrap();
+
+        let rule = FileRule {
+            id: "wide".into(),
+            path: tmp.path().to_path_buf(),
+            enabled: true,
+            recursive: true,
+            trigger_window: 3,
+            match_mode: MatchMode::Fragment,
+            min_fragment_len: Some(8),
+            min_fragment_ratio: None,
+            formats: vec!["txt".into()],
+            index: FileIndexOptions {
+                bloom_megabytes: 1,
+                build_workers: 2,
+                scan_workers: 4,
+                scan_rg_prefilter: true,
+                scan_rg_literals_max: 256,
+                ..Default::default()
+            },
+        };
+
+        let index_root = tmp.path().join("idx");
+        let snapshot = build_rule_index(&index_root, &rule).unwrap();
+        assert!(!snapshot.literals.is_empty());
+
+        let padding = "x".repeat(20_000);
+        let hay = format!("{padding} WIDE-CORPUS-LEAK-TOKEN-99 {padding}");
+        let out = scan_haystack(&hay, &rule, &snapshot);
+        assert!(!out.contains("WIDE-CORPUS-LEAK-TOKEN-99"));
+        assert_eq!(out.chars().count(), hay.chars().count());
     }
 }

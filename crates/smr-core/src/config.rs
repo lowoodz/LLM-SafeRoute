@@ -195,6 +195,12 @@ pub struct FileIndexOptions {
     pub build_workers: usize,
     #[serde(default = "default_scan_stride")]
     pub scan_stride: usize,
+    #[serde(default = "default_scan_workers")]
+    pub scan_workers: usize,
+    #[serde(default = "default_true")]
+    pub scan_rg_prefilter: bool,
+    #[serde(default = "default_scan_rg_literals_max")]
+    pub scan_rg_literals_max: usize,
 }
 
 impl Default for FileIndexOptions {
@@ -209,6 +215,9 @@ impl Default for FileIndexOptions {
             bloom_megabytes: default_bloom_megabytes(),
             build_workers: default_build_workers(),
             scan_stride: default_scan_stride(),
+            scan_workers: default_scan_workers(),
+            scan_rg_prefilter: default_true(),
+            scan_rg_literals_max: default_scan_rg_literals_max(),
         }
     }
 }
@@ -239,6 +248,12 @@ fn default_build_workers() -> usize {
 }
 fn default_scan_stride() -> usize {
     16
+}
+fn default_scan_workers() -> usize {
+    4
+}
+fn default_scan_rg_literals_max() -> usize {
+    2048
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

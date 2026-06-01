@@ -6,6 +6,7 @@ use std::path::Path;
 
 const DEFAULT_K: u32 = 7;
 
+#[derive(Clone)]
 pub struct BloomFilter {
     words: Vec<u64>,
     bit_count: usize,

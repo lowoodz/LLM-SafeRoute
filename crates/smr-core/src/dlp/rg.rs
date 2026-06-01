@@ -9,36 +9,54 @@ pub fn find_matching_needles(haystack: &str, needles: &[String]) -> Vec<String> 
         return Vec::new();
     }
 
-    let haystack_bytes = haystack.as_bytes();
     let mut found = Vec::new();
-
     for needle in needles {
         if needle.is_empty() {
             continue;
         }
-        if contains_fixed_string(haystack_bytes, needle) {
+        if contains_fixed_string(haystack.as_bytes(), needle.as_bytes()) {
             found.push(needle.clone());
         }
     }
-
     found
 }
 
-fn contains_fixed_string(haystack: &[u8], needle: &str) -> bool {
-    let Ok(matcher) = RegexMatcherBuilder::new()
-        .fixed_strings(true)
-        .build(needle)
-    else {
-        return haystack
-            .windows(needle.len())
-            .any(|window| window == needle.as_bytes());
-    };
+/// All byte offsets where `needle` occurs in `haystack` (non-overlapping scan, step 1 after each hit).
+pub fn find_literal_byte_offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return Vec::new();
+    }
 
-    matcher
-        .find(haystack)
-        .ok()
-        .flatten()
-        .is_some()
+    if let Ok(needle_str) = std::str::from_utf8(needle) {
+        if let Ok(matcher) = RegexMatcherBuilder::new()
+            .fixed_strings(true)
+            .build(needle_str)
+        {
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while from < haystack.len() {
+                match matcher.find(&haystack[from..]) {
+                    Ok(Some(m)) => {
+                        out.push(from + m.start());
+                        from += m.start() + 1;
+                    }
+                    _ => break,
+                }
+            }
+            return out;
+        }
+    }
+
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn contains_fixed_string(haystack: &[u8], needle: &[u8]) -> bool {
+    !find_literal_byte_offsets(haystack, needle).is_empty()
 }
 
 #[cfg(test)]
@@ -85,5 +103,12 @@ mod tests {
             find_matching_needles(hay, &needles),
             vec!["alpha".to_string(), "gamma".to_string()]
         );
+    }
+
+    #[test]
+    fn finds_all_byte_offsets() {
+        let hay = b"abc abc abc";
+        let needle = b"abc";
+        assert_eq!(find_literal_byte_offsets(hay, needle), vec![0, 4, 8]);
     }
 }
