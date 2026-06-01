@@ -904,8 +904,17 @@ def scenario_session_window_exhaustion(report: Report, secrets_dir: Path) -> Non
             session=session,
             max_tokens=12,
         )
-        audit = latest_audit(BASE)
-        dlp_counts.append(int(audit.get("dlp_replacements", 0)) if audit else 0)
+        dlp = 0
+        for _ in range(8):
+            audit = latest_audit(BASE)
+            dlp = int(audit.get("dlp_replacements", 0)) if audit else 0
+            if i < 2 and dlp > 0:
+                break
+            if i == 2:
+                break
+            time.sleep(0.25)
+        dlp_counts.append(dlp)
+        time.sleep(0.2)
     ok = dlp_counts[0] > 0 and dlp_counts[1] > 0 and dlp_counts[2] == 0
     report.add(story, "session_window_exhaustion", ok, f"dlp_per_turn={dlp_counts}", 0)
 
