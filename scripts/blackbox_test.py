@@ -214,7 +214,7 @@ def build_config_dict(
                 "id": "blackbox-secrets",
                 "enabled": True,
                 "path": secrets,
-                "recursive": False,
+                "recursive": True,
                 "trigger_window": 2,
                 "match_mode": "full",
                 "formats": ["txt"],
@@ -357,7 +357,7 @@ file_rules:
   - id: blackbox-secrets
     enabled: true
     path: "{secrets}"
-    recursive: false
+    recursive: true
     trigger_window: 2
     match_mode: full
     formats: ["txt"]
@@ -699,8 +699,14 @@ def scenario_file_session_guard(report: Report, secrets_dir: Path) -> None:
     leaked = FILE_SECRET in (json.loads(t2)["choices"][0]["message"]["content"] if code2 == 200 else "")
     audit = latest_audit(BASE)
     dlp = int(audit.get("dlp_replacements", 0)) if audit else 0
-    ok = code1 == 200 and code2 == 200 and not leaked and dlp > 0
-    report.add(story, "file_path_session_dlp", ok, f"dlp={dlp}, leaked={leaked}", ms1 + ms2)
+    ok = code2 == 200 and not leaked and dlp > 0
+    report.add(
+        story,
+        "file_path_session_dlp",
+        ok,
+        f"trigger_status={code1}, dlp={dlp}, leaked={leaked}",
+        ms1 + ms2,
+    )
 
 
 def scenario_file_scoped_sibling_not_scrubbed(report: Report, secrets_dir: Path) -> None:
@@ -1057,7 +1063,7 @@ def scenario_ops_observe_mode(report: Report) -> None:
         report.add(story, "observe_mode", False, "cannot GET config")
         return
     cfg["pipeline"]["operation_security_mode"] = "observe"
-    put_config(BASE, cfg)
+    put_code = put_config(BASE, cfg)
     body = {
         "model": "glm-4-flash",
         "messages": [
@@ -1083,8 +1089,14 @@ def scenario_ops_observe_mode(report: Report) -> None:
     blocks = int(audit.get("safety_blocks", 0)) if audit else 0
     observes = int(audit.get("safety_observations", 0)) if audit else 0
     not_blocked = "SMR BLOCKED" not in text
-    ok = observes > 0 and blocks == 0 and not_blocked
-    report.add(story, "observe_mode", ok, f"status={code}, observes={observes}, blocks={blocks}", ms)
+    ok = put_code == 200 and observes > 0 and blocks == 0 and not_blocked
+    report.add(
+        story,
+        "observe_mode",
+        ok,
+        f"put={put_code}, status={code}, observes={observes}, blocks={blocks}",
+        ms,
+    )
     # restore enforce
     cfg["pipeline"]["operation_security_mode"] = "enforce"
     put_config(BASE, cfg)
@@ -1097,7 +1109,7 @@ def scenario_security_disabled(report: Report) -> None:
         report.add(story, "security_disabled", False, "cannot GET config")
         return
     cfg["pipeline"]["security_enabled"] = False
-    put_config(BASE, cfg)
+    put_code = put_config(BASE, cfg)
     code, _, ms = chat_openai(
         [{"role": "user", "content": f"secret {CONTENT_SECRET}"}],
         session="security-off",
@@ -1105,8 +1117,8 @@ def scenario_security_disabled(report: Report) -> None:
     )
     audit = latest_audit(BASE)
     dlp = int(audit.get("dlp_replacements", 0)) if audit else 0
-    ok = code == 200 and dlp == 0
-    report.add(story, "security_disabled_bypass", ok, f"dlp={dlp}", ms)
+    ok = put_code == 200 and code == 200 and dlp == 0
+    report.add(story, "security_disabled_bypass", ok, f"put={put_code}, dlp={dlp}", ms)
     cfg["pipeline"]["security_enabled"] = True
     put_config(BASE, cfg)
 

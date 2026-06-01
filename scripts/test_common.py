@@ -55,7 +55,13 @@ def http(
     hdrs = {"Content-Type": "application/json"}
     if headers:
         hdrs.update(headers)
-    data = json.dumps(body).encode() if body is not None else None
+    if body is not None:
+        data = json.dumps(body).encode()
+    elif method in ("PUT", "PATCH"):
+        # Windows Python urllib rejects bodyless PUT (reload API).
+        data = b"{}"
+    else:
+        data = None
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     start = time.perf_counter()
     try:

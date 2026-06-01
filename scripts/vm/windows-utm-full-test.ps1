@@ -50,11 +50,16 @@ if (Test-Path $KeysPath) {
 Get-Process smr -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
-# Prepare secrets for file DLP / path protection
+function Write-Utf8NoBom($Path, $Value) {
+    $enc = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $Value, $enc)
+}
+
+# Prepare secrets for file DLP / path protection (no BOM — Set-Content UTF8 adds BOM and breaks full-match DLP)
 New-Item -ItemType Directory -Force -Path $VaultDir | Out-Null
-Set-Content -Path (Join-Path $SecretsDir "probe.txt") -Value "LOCAL-INSTALL-FILE-SECRET-XYZ" -Encoding UTF8
-Set-Content -Path (Join-Path $SecretsDir "project.txt") -Value "project-data" -Encoding UTF8
-Set-Content -Path (Join-Path $VaultDir "secret.txt") -Value "vault-secret-data" -Encoding UTF8
+Write-Utf8NoBom (Join-Path $SecretsDir "probe.txt") "LOCAL-INSTALL-FILE-SECRET-XYZ"
+Write-Utf8NoBom (Join-Path $SecretsDir "project.txt") "project-data"
+Write-Utf8NoBom (Join-Path $VaultDir "secret.txt") "vault-secret-data"
 
 # Extract + install (fixed prefix for guest-agent SYSTEM account)
 if (-not (Test-Path $ZipPath)) { Log "ERROR: zip not found: $ZipPath"; exit 1 }
