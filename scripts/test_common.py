@@ -176,3 +176,12 @@ def dlp_after_chat(base: str, session_id: str, chat_fn) -> int:
         time.sleep(0.25)
     audit = latest_audit_for_session(base, session_id)
     return int(audit.get("dlp_replacements", 0)) if audit else 0
+
+
+def warm_file_index(base: str) -> bool:
+    for attempt in range(5):
+        code, _, _ = http("PUT", f"{base}/api/reload", timeout=180.0)
+        if code == 200 and wait_ready(base, timeout=180.0):
+            return True
+        time.sleep(2.0 * (attempt + 1))
+    return False

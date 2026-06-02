@@ -28,6 +28,7 @@ from test_common import (  # noqa: E402
     start_smr,
     stop_smr,
     wait_ready,
+    warm_file_index,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -504,6 +505,7 @@ def run_all_scenarios(report: Report, secrets_dir: Path) -> None:
     scenario_multi_turn_agent(report)
     scenario_dlp_user_message(report)
     scenario_preset_credentials(report)
+    warm_file_index(BASE)
     scenario_file_session_guard(report, secrets_dir)
     scenario_file_scoped_sibling_not_scrubbed(report, secrets_dir)
     scenario_directory_only_no_file_dlp(report, secrets_dir)
@@ -692,14 +694,21 @@ def scenario_file_session_guard(report: Report, secrets_dir: Path) -> None:
         body=trigger,
         headers={"X-SMR-Session-Id": session},
     )
-    code2, t2, ms2 = chat_openai(
-        [{"role": "user", "content": f"Copied: {FILE_SECRET}"}],
-        session=session,
-        max_tokens=20,
-    )
+    chat_result: dict[str, object] = {}
+
+    def do_chat() -> None:
+        code, text, ms = chat_openai(
+            [{"role": "user", "content": f"Copied: {FILE_SECRET}"}],
+            session=session,
+            max_tokens=20,
+        )
+        chat_result.update(code=code, text=text, ms=ms)
+
+    dlp = dlp_after_chat(BASE, session, do_chat)
+    code2 = int(chat_result.get("code", 0))
+    t2 = str(chat_result.get("text", ""))
+    ms2 = float(chat_result.get("ms", 0.0))
     leaked = FILE_SECRET in (json.loads(t2)["choices"][0]["message"]["content"] if code2 == 200 else "")
-    audit = latest_audit(BASE)
-    dlp = int(audit.get("dlp_replacements", 0)) if audit else 0
     ok = code2 == 200 and not leaked and dlp > 0
     report.add(
         story,
@@ -1300,12 +1309,6 @@ def main() -> int:
             print_report(report)
             return 1
         report.add("系统", "startup", True, "ready")
-        for attempt in range(3):
-            reload_code, _, _ = http("PUT", f"{BASE}/api/reload", timeout=120.0)
-            if reload_code == 200:
-                wait_ready(BASE, timeout=120.0)
-                break
-            time.sleep(1.0 + attempt)
 
         run_all_scenarios(report, secrets_dir)
 
